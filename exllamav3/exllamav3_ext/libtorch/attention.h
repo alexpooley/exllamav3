@@ -95,7 +95,8 @@ struct BC_Attention
     float qkv_K;
     bool qkv_mcg;
     bool qkv_mul1;
-    at::Tensor qkv_size_n, qkv_n_stride, qkv_had_src;   // device int32, per slice
+    at::Tensor qkv_size_n;                                    // device int32, per slice
+    c10::optional<at::Tensor> qkv_n_stride, qkv_had_src;      // sliced mode only; whole mode (one entry per source) has neither
     at::Tensor qkv_carrier;   // (slices, MAX_R, width) zero-stride dtype/width carrier for the mgemm C argument
     int qkv_num_src = 0;
 
