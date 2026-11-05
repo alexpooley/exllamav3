@@ -31,7 +31,13 @@ def hc_flush(params: dict):
         x, y, post, comb = p
         b, s, H, D = x.shape
         R = b * s
-        ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H), None, None)
+        ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H),
+                     comb.view(R, H, H) if comb is not None else None, None, None)
+
+# GatedResidual decode rows on ROCm: apply_ defers its residual update into the next site's mix (gr_mix runs it
+# on the fly and writes the updated streams back), saving the hc_apply launch. The pending entry is the mHC
+# "hc_pending" one with comb None, so every hc_flush point (device moves, PLE, HyperHead) lands it as well
+_gr_fold = os.environ.get("EXL3_GR_FOLD", "1" if torch.version.hip else "0") != "0"
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -408,6 +414,8 @@ class GatedResidual(Module):
         self.rank = 0
         self.tiled = False          # prefill mixes take the tiled deterministic kernel
         self.next_site = None       # GatedResidual whose mix follows this site's apply_ (link_sites)
+        self._post_buf = None       # this site's decode post gates: a deferred apply_ still reads them while
+                                    # the next site's mix writes its own, so they cannot share a buffer
 
     @override
     def load(self, device: torch.device, keep_source_weights: bool = False, **kwargs):
@@ -534,6 +542,10 @@ class GatedResidual(Module):
                 if prev is not None:
                     prev.next_site = site
                 prev = site
+            # A block that scales its streams after the mlp site (layer scalar) reads them between two sites
+            if getattr(m, "key_layer_scalar", None) is not None:
+                prev.next_site = None
+                prev = None
         if prev is not None:
             prev.next_site = None
 
@@ -575,12 +587,20 @@ class GatedResidual(Module):
         H, Dh = self.hc_mult, self.hidden_size
         R = streams.shape[0] * streams.shape[1]
         s3 = streams.reshape(R, H, Dh)
+        if params is not None and "hc_pending" in params:
+            p = params["hc_pending"]
+            if p[3] is not None or p[0].data_ptr() != streams.data_ptr() or streams.dtype != torch.float \
+                    or not streams.is_contiguous() or R > self.FUSED_MAX_R:
+                hc_flush(params)
         if s3.dtype != torch.float:
             s3 = s3.float()          # MTP sample_from_state passes the half draft stack
         if not s3.is_contiguous():
             s3 = s3.contiguous()
         dev = s3.device
         xw = self._weighted_copy(s3, params)
+        pend = params.pop("hc_pending", None) if params is not None else None
+        if pend is not None:
+            xw = None
 
         if R <= self.FUSED_MAX_R:
             # Decode/MTP-class row counts (the fused path's whole domain) take bucketed
@@ -595,10 +615,17 @@ class GatedResidual(Module):
                 return torch.empty((numel,), dtype = dtype, device = dev)
             M = self.proj_m + 1
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
-            post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
+            post = None
+            if self.use_combine:
+                if cached:
+                    if self._post_buf is None or self._post_buf.device != dev:
+                        self._post_buf = torch.empty((self.FUSED_MAX_R * H,), dtype = torch.float, device = dev)
+                    post = self._post_buf[: R * H].view(R, H)
+                else:
+                    post = torch.empty((R, H), dtype = torch.float, device = dev)
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
             ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed,
-                       None, None)
+                       pend[1] if pend is not None else None, pend[2] if pend is not None else None)
         elif self.tiled:
             # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
             # reuses segments across chunk sizes), never statics
@@ -663,6 +690,13 @@ class GatedResidual(Module):
         if y2.dtype not in (torch.half, torch.float):
             y2 = y2.half()
         x3 = x.view(R, self.hc_mult, self.hidden_size)
+        hc_flush(params)
+        nxt = self.next_site
+        if _gr_fold and R <= self.FUSED_MAX_R and nxt is not None and nxt.w_h is not None \
+                and nxt.w_h.device == x.device and x.dtype == torch.float and x.is_contiguous() \
+                and not params.get("export_state_layers") and "backend" not in params:
+            params["hc_pending"] = (x, y2.contiguous(), post.reshape(R, self.hc_mult).contiguous(), None)
+            return x
         # Decode-class rows: also emit the successor's weighted stream copy for its fused mix
         # (the prefill path applies the weight itself). Same static bucket for every site on
         # the device: the copy is consumed by the very next mix on the stream.
@@ -689,6 +723,7 @@ class GatedResidual(Module):
         # MTP trunk tap: models without a final norm export the PRE-collapse stream stack here
         # (flattened), the analog of the RMSNorm export hook
         if self.key in params.get("export_state_norm_keys", ()):
+            hc_flush(params)
             states = params.get("export_states")
             if states is None:
                 states = params["export_states"] = []

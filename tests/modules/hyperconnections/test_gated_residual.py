@@ -11,7 +11,8 @@ import pytest
 import torch
 
 from exllamav3.ext import exllamav3_ext as ext
-from exllamav3.modules.hyperconnections import GatedResidual
+from exllamav3.modules import hyperconnections as hcmod
+from exllamav3.modules.hyperconnections import GatedResidual, hc_flush
 
 pytestmark = [
     pytest.mark.cc(8, 0),
@@ -189,7 +190,8 @@ def test_tiled_tables_match_stored(device):
 
 
 @pytest.mark.parametrize("D, rank", [(1024, 320), (2560, 320)])     # generic and shape-templated dots kernels
-def test_weighted_copy_handoff(device, D, rank):
+def test_weighted_copy_handoff(device, D, rank, monkeypatch):
+    monkeypatch.setattr(hcmod, "_gr_fold", False)      # the copy is the unfolded handoff
     # apply_ of one site emits the next site's weighted stream copy; the next mix must use it and agree with the
     # in-kernel weighting to fp32 rounding, and both with the reference
     a, b = make_site(device, D, rank, True, seed = 1), make_site(device, D, rank, True, seed = 2)
@@ -229,7 +231,8 @@ def test_weighted_copy_handoff(device, D, rank):
     assert "gr_weighted" not in params
 
 
-def test_weighted_copy_rejected_when_stale(device):
+def test_weighted_copy_rejected_when_stale(device, monkeypatch):
+    monkeypatch.setattr(hcmod, "_gr_fold", False)
     # A copy for another site, another stream tensor or another device is ignored (and consumed), and the mix
     # falls back to the in-kernel weighting
     D, rank = 1024, 320
@@ -270,3 +273,58 @@ def test_link_sites_chain(device):
     assert s[0].next_site is s[1] and s[1].next_site is s[2] and s[2].next_site is s[3]
     assert s[3].next_site is None              # the foreign module breaks the chain
     assert s[4].next_site is s[5] and s[5].next_site is mixer and mixer.next_site is None
+
+
+@pytest.mark.parametrize("D, rank", [(2560, 320), (1024, 320)])
+@pytest.mark.parametrize("y_dtype", [torch.half, torch.float])
+def test_folded_apply(device, D, rank, y_dtype, monkeypatch):
+    # apply_ deferred into the next site's mix (hc_pending, comb None): the mix runs the update on the fly and
+    # writes the streams back; streams, gates and mixed agree with the unfolded sequence, and are reproducible
+    a, b = make_site(device, D, rank, True, seed = 1), make_site(device, D, rank, True, seed = 2)
+    GatedResidual.link_sites([a, b])
+    for R in (1, 3, 8):
+        torch.manual_seed(R)
+        x0 = torch.randn(1, R, 4, D, device = device) * 3.0
+        y = torch.randn(1, R, D, device = device).to(y_dtype)
+        post = torch.rand(1, R, 4, device = device) * 2
+        outs = []
+        for fold in (False, True, True):
+            monkeypatch.setattr(hcmod, "_gr_fold", fold)
+            x = x0.clone()
+            params = {}
+            a.apply_(x, y, post, None, params)
+            assert ("hc_pending" in params) == fold
+            p, _, m = b.mix(x, params)
+            assert "hc_pending" not in params
+            outs.append((x.clone(), p.clone(), m.clone()))
+        x_ref = x0 + post.unsqueeze(-1) * y.float().unsqueeze(-2)
+        assert rel(outs[1][0], x_ref) < 1e-6, R
+        assert rel(outs[1][0], outs[0][0]) < 1e-6, R
+        assert rel(outs[1][2], outs[0][2]) < 1e-3, R
+        assert rel(outs[1][1], outs[0][1]) < 1e-4, R
+        for t1, t2 in zip(outs[1], outs[2]):
+            assert torch.equal(t1, t2), R
+
+
+def test_folded_apply_flush(device, monkeypatch):
+    # A pending apply for another stream tensor lands (hc_flush) before the mix reads its own streams
+    monkeypatch.setattr(hcmod, "_gr_fold", True)
+    D, rank, R = 1024, 320, 2
+    a, b = make_site(device, D, rank, True, seed = 1), make_site(device, D, rank, True, seed = 2)
+    GatedResidual.link_sites([a, b])
+    x = torch.randn(1, R, 4, D, device = device)
+    y = torch.randn(1, R, D, device = device, dtype = torch.half)
+    post = torch.rand(1, R, 4, device = device)
+    x_ref = x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
+    params = {}
+    a.apply_(x, y, post, None, params)
+    x2 = x_ref.clone()
+    _, _, m2 = b.mix(x2, params)
+    assert "hc_pending" not in params
+    assert rel(x, x_ref) < 1e-6
+    assert rel(m2, b._mix_ref(x_ref)[1].view(R, D)) < 3e-3
+    # explicit flush
+    x = x_ref.clone() - post.unsqueeze(-1) * y.float().unsqueeze(-2)
+    a.apply_(x, y, post, None, params)
+    hc_flush(params)
+    assert "hc_pending" not in params and rel(x, x_ref) < 1e-6
