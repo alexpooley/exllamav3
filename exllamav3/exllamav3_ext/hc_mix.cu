@@ -1420,3 +1420,55 @@ void gr_mix
     #undef ARGS
     cuda_check(cudaPeekAtLastError());
 }
+
+
+#if defined(USE_ROCM)
+// GatedResidual decode mix with int8 tables (gr_site_i8_try): true when launched, false when the shape or device
+// does not fit (the caller then runs gr_mix on the fp16 tables). Same pending-apply contract as gr_mix.
+bool gr_mix_i8
+(
+    const at::Tensor& streams,           // (1, H, D) float
+    const at::Tensor& fn_q,              // (M, H * D) int8
+    const at::Tensor& fn_s,              // (M, H * D / 128) half
+    const at::Tensor& upt_q,             // (H, D / 4, LR, 4) int8
+    const at::Tensor& upt_s,             // (H, D / 4, LR / 64, 4) half
+    const at::Tensor& w,                 // (H * D) half
+    double rms_eps,
+    at::Tensor dots,                     // (1, M + 1, H) float
+    c10::optional<at::Tensor> post,      // (1, H) float, or none
+    at::Tensor mixed,                    // (1, D) half
+    const c10::optional<at::Tensor>& pend_y,
+    const c10::optional<at::Tensor>& pend_post,
+    const at::Tensor& bar                // (2) int32 zeroed once
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(streams.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(streams, kFloat);
+    TORCH_CHECK_DTYPE(fn_q, kChar);
+    TORCH_CHECK_DTYPE(upt_q, kChar);
+    TORCH_CHECK_DTYPE(fn_s, kHalf);
+    TORCH_CHECK_DTYPE(upt_s, kHalf);
+    TORCH_CHECK_DTYPE(w, kHalf);
+    TORCH_CHECK_DTYPE(mixed, kHalf);
+    TORCH_CHECK(bar.dtype() == at::kInt && bar.numel() >= 2, "gr_mix_i8: bar");
+    TORCH_CHECK(streams.is_contiguous() && fn_q.is_contiguous() && fn_s.is_contiguous() && upt_q.is_contiguous() &&
+                upt_s.is_contiguous() && dots.is_contiguous(), "gr_mix_i8: contiguous inputs required");
+    const int R = streams.size(0), H = streams.size(1), D = streams.size(2);
+    const int LR = upt_q.size(2);
+    const int M = fn_q.size(0);
+    TORCH_CHECK(H == 4 && M == LR + (post ? H : 0) && fn_q.size(1) == H * D && fn_s.size(1) == H * D / 128 &&
+                upt_s.size(2) == LR / 64, "gr_mix_i8: shapes");
+    const void* py_p = nullptr; const float* pp_p = nullptr; bool y_half = false;
+    if (pend_y)
+    {
+        TORCH_CHECK(pend_post, "gr_mix_i8: pending apply needs its post");
+        y_half = pend_y.value().dtype() == at::kHalf;
+        py_p = pend_y.value().data_ptr(); pp_p = (const float*) pend_post.value().data_ptr();
+    }
+    return gr_site_i8_try((float*) streams.data_ptr(), py_p, y_half, pp_p, (const int8_t*) fn_q.data_ptr(),
+                          (const half*) fn_s.data_ptr(), (const int8_t*) upt_q.data_ptr(), (const half*) upt_s.data_ptr(),
+                          (const half*) w.data_ptr(), (float*) dots.data_ptr(), post ? (float*) post.value().data_ptr() : nullptr,
+                          (half*) mixed.data_ptr(), (unsigned*) bar.data_ptr(), LR, D, R, (float) rms_eps, stream);
+}
+#endif

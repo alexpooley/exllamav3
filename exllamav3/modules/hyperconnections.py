@@ -40,6 +40,22 @@ def hc_flush(params: dict):
 _gr_fold = os.environ.get("EXL3_GR_FOLD", "1" if torch.version.hip else "0") != "0"
 _gr_fold_tp = os.environ.get("EXL3_GR_FOLD_TP", "1") != "0"
 
+# Experimental: int8 decode tables for the one-launch site kernel (R = 1, ROCm, the Qwen3.8 shape), quantized at load:
+# symmetric absmax, one fp16 scale per 128 proj columns (along H * D) and per 64 up ranks per output channel. Halves
+# the site's table bytes; off until a quality eval clears it. Other row counts keep the fp16 tables.
+_gr_i8 = os.environ.get("EXL3_GR_I8", "0") != "0"
+
+
+def _quant_i8(t: torch.Tensor, g: int, dim: int):
+    """Symmetric absmax int8 with one fp16 scale per g elements along dim: (q int8, scales half)"""
+    t = t.float().movedim(dim, -1)
+    sh = t.shape
+    tg = t.reshape(*sh[:-1], sh[-1] // g, g)
+    sc = (tg.abs().amax(-1) / 127.0).clamp_min(1e-12).half()
+    q = torch.round(tg / sc.float().unsqueeze(-1)).clamp_(-127, 127).to(torch.int8)
+    return q.reshape(sh).movedim(-1, dim).contiguous(), sc.movedim(-1, dim).contiguous()
+
+
 # Grid-barrier words for the one-launch GatedResidual decode site (gr_mix on ROCm), one zeroed pair per device;
 # the kernel leaves them as it found them, so graph replays and every site share them
 _gr_site_bars = {}
@@ -480,6 +496,12 @@ class GatedResidual(Module):
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
+        self.proj_q = self.proj_s = self.upx_q = self.upx_s = None
+        if _gr_i8 and torch.version.hip and dev.type == "cuda" and H == 4 and Dh == 2560 and self.rank == 320 \
+                and hasattr(ext, "gr_mix_i8"):
+            self.proj_q, self.proj_s = _quant_i8(self.proj_h[: self.proj_m], 128, 1)
+            uq, us = _quant_i8(self.upx_h.view(H, Dh // 4, self.rank // 64, 64, 4), 64, 3)
+            self.upx_q, self.upx_s = uq.view(H, Dh // 4, self.rank, 4), us.view(H, Dh // 4, self.rank // 64, 4)
         if self.tiled and not keep_source_weights:
             # Every inference consumer reads proj_h directly or the repacked up (the tiled path
             # derives its int8 tables per call, _tiled_tables): release the checkpoint-layout up
@@ -490,6 +512,7 @@ class GatedResidual(Module):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = None
+        self.proj_q = self.proj_s = self.upx_q = self.upx_s = None
 
     @override
     def get_tensors(self):
@@ -636,6 +659,11 @@ class GatedResidual(Module):
                 else:
                     post = torch.empty((R, H), dtype = torch.float, device = dev)
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
+            if R == 1 and self.proj_q is not None and ext.gr_mix_i8(
+                s3, self.proj_q, self.proj_s, self.upx_q, self.upx_s, self.w_h, self.rms_eps, dots, post, mixed,
+                pend[1] if pend is not None else None, pend[2] if pend is not None else None, _gr_site_bar(dev)
+            ):
+                return post, mixed
             ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed,
                        pend[1] if pend is not None else None, pend[2] if pend is not None else None,
                        _gr_site_bar(dev))
