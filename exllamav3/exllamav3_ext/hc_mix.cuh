@@ -97,7 +97,8 @@ void gr_mix
     c10::optional<at::Tensor> post,
     at::Tensor mixed,
     const c10::optional<at::Tensor>& pend_y,
-    const c10::optional<at::Tensor>& pend_post
+    const c10::optional<at::Tensor>& pend_post,
+    const c10::optional<at::Tensor>& bar
 );
 
 // Tiled deterministic GatedResidual mix for prefill row counts (hc_mix_tiled.cu)

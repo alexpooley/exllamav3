@@ -1282,7 +1282,8 @@ void gr_mix
     c10::optional<at::Tensor> post,      // (R, H) float out, or none (final-mixer form)
     at::Tensor mixed,                    // (R, D) half or float out
     const c10::optional<at::Tensor>& pend_y,     // (R, D) half or float: a deferred apply on streams, or none
-    const c10::optional<at::Tensor>& pend_post   // (R, H) float: its gates (streams += pend_post * pend_y first)
+    const c10::optional<at::Tensor>& pend_post,  // (R, H) float: its gates (streams += pend_post * pend_y first)
+    const c10::optional<at::Tensor>& bar         // (2) int32 zeroed once: grid-barrier words for the one-launch site, or none
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
@@ -1317,6 +1318,7 @@ void gr_mix
     TORCH_CHECK(D > 0, "gr_mix: norm over an empty stream dimension");
     if (!R) return;
     const half* w_p = (const half*) w.data_ptr();
+    if (bar) TORCH_CHECK(bar.value().dtype() == at::kInt && bar.value().numel() >= 2 && bar.value().device() == streams.device(), "gr_mix: bar");
 
     // A deferred apply: the RDNA pair runs it on the fly (and writes the updated streams back); elsewhere it
     // lands first as a plain hc_apply launch
@@ -1334,7 +1336,8 @@ void gr_mix
 #if defined(USE_ROCM)
     if (gr_mix_rdna_try((float*) streams.data_ptr(), ws_p, (const half*) fn.data_ptr(), (const half*) upt.data_ptr(), w_p,
                         py_p, y_half, pp_p, (float*) dots.data_ptr(), post ? (float*) post.value().data_ptr() : nullptr,
-                        mixed.data_ptr(), mixed.dtype() == at::kHalf, M, LR, D, R, (float) rms_eps, stream))
+                        mixed.data_ptr(), mixed.dtype() == at::kHalf, M, LR, D, R, (float) rms_eps, stream,
+                        bar ? (unsigned*) bar.value().data_ptr() : nullptr))
         return;
 #endif
     if (py_p)

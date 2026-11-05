@@ -292,12 +292,12 @@ def test_gr_mix_empty_rows(device, D, LR):
     dbuf, dots = _sentinel((0, M_ + 1, H), device)
     pbuf, post = _sentinel((0, H), device)
     mbuf, mixed = _sentinel((0, D), device, torch.half)
-    ext.gr_mix(streams, None, fn, upt, w, 1e-6, dots, post, mixed, None, None)
+    ext.gr_mix(streams, None, fn, upt, w, 1e-6, dots, post, mixed, None, None, None)
     assert (dbuf == 7.0).all() and (pbuf == 7.0).all() and (mbuf == 7.0).all()
     with pytest.raises(RuntimeError, match = "gr_mix: norm over an empty stream dimension"):
         s, f, u, ww, _ = _gr_inputs(2, 0, LR, True, device)
         ext.gr_mix(s, None, f, u, ww, 1e-6, torch.empty((2, M_ + 1, H), device = device),
-                   torch.empty((2, H), device = device), torch.empty((2, 0), dtype = torch.half, device = device), None, None)
+                   torch.empty((2, H), device = device), torch.empty((2, 0), dtype = torch.half, device = device), None, None, None)
     assert_device_ok(device)
 
 
@@ -308,7 +308,7 @@ def test_gr_mix_zero_rank(device):
     R, D, eps = 3, 256, 1e-6
     streams, fn, upt, w, M_ = _gr_inputs(R, D, 0, False, device)
     mixed = torch.empty((R, D), dtype = torch.float, device = device)
-    ext.gr_mix(streams, None, fn, upt, w, eps, torch.empty((R, M_ + 1, H), device = device), None, mixed, None, None)
+    ext.gr_mix(streams, None, fn, upt, w, eps, torch.empty((R, M_ + 1, H), device = device), None, mixed, None, None, None)
     s = streams.double()
     normed = s * torch.rsqrt(s.pow(2).mean(-1, keepdim = True) + eps) * w.double().view(H, D)
     torch.testing.assert_close(mixed.double(), 0.5 * normed.mean(1), rtol = 1e-5, atol = 1e-6)
