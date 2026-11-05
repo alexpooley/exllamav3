@@ -659,7 +659,7 @@ class GatedResidual(Module):
                 else:
                     post = torch.empty((R, H), dtype = torch.float, device = dev)
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            if R == 1 and self.proj_q is not None and ext.gr_mix_i8(
+            if R <= 2 and self.proj_q is not None and ext.gr_mix_i8(
                 s3, self.proj_q, self.proj_s, self.upx_q, self.upx_s, self.w_h, self.rms_eps, dots, post, mixed,
                 pend[1] if pend is not None else None, pend[2] if pend is not None else None, _gr_site_bar(dev)
             ):

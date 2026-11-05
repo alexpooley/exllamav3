@@ -521,17 +521,20 @@ void gr_finalize2_kernel
 }
 
 // ---------------------------------------------------------------------------------------------
-// One persistent kernel per decode site (R = 1): the previous site's apply, the dots and the finalize in a single
-// launch. Phase 0 issues the block's share of the stream stack (L2) and then its proj dot rows and up column
-// quads (activation-independent, the whole 13 MB table in flight at once) and builds the updated, weighted stack
-// in LDS plus the per-stream sums of squares (every block, same order). Phase 1: one warp per (proj row j,
-// stream h) pair against the LDS stack. A grid barrier (a monotonic 64-bit counter in a zeroed 2-word buffer, never
-// reset, so graph replays work) separates it from phase 2: every block derives rmr and t from the dots
-// in a fixed order, one warp per column quad finishes mixed and writes the updated streams back. The grid is
-// one block per CU (co-resident: 512 threads, ~190 VGPRs, 43 KB LDS). No float atomics: run-to-run
-// bit-reproducible; dots differ from the pair only in summation order.
+// One persistent kernel per decode site for R = 1..4 rows (decode and the MTP verify): the previous site's apply,
+// the dots and the finalize in a single launch, the tables read once for all rows. Block b owns stream h = b % 4,
+// 1 / 24 of the proj rows (one warp each) and up to 8 column quads. Phase 0 issues the proj rows and up quads
+// (activation-independent, the whole table in flight at once), stages the quads' stream values in LDS and builds
+// the updated, weighted stack of stream h for every row in LDS with its sums of squares. Phase 1: R dots per proj
+// row against the stack. A grid barrier (a monotonic 64-bit counter in a zeroed 2-word buffer, so graph
+// replays work) separates it from phase 2: every block derives rmr and t from the dots in a fixed order; one warp
+// per column quad accumulates the up gates for a pair of rows at a time, reduce-scatters them so each lane owns
+// one (row, stream, column) value, and finishes mixed and the updated streams. 96 blocks of 512 threads,
+// co-resident (<= 192 VGPRs, <= 50 KB LDS). No float atomics: run-to-run bit-reproducible; results differ from
+// the pair only in summation order. I8: int8 tables with fp16 group scales (EXL3_GR_I8).
 #define GRS_NT 512
 #define GRS_NW (GRS_NT / 32)
+#define GRS_NB 96             // grid: block b owns stream b % 4 and 1 / 24 of the proj rows
 
 __device__ __forceinline__ float grs_xor_sum32(float v)
 {
@@ -565,120 +568,100 @@ __device__ __forceinline__ void grs_grid_barrier(unsigned* bar, unsigned nb)
 
 // D: hidden, LR: low rank, POST: site form (M = LR + H proj rows) vs final mixer (M = LR)
 // APPLY: fold the previous site's apply (x += pp * y); y is Y_T
-template <int H, int D, int LR, bool POST, bool APPLY, typename Y_T, bool I8>
+// Opaque register touch: stops the compiler from hoisting the per-row unpacking of loop-invariant packed
+// weights out of the row loop (it would keep every converted fp32 value live: hundreds of VGPRs)
+__device__ __forceinline__ void grs_opaque(int4& v) { asm volatile("" : "+v"(v.x), "+v"(v.y), "+v"(v.z), "+v"(v.w)); }
+__device__ __forceinline__ void grs_opaque(int2& v) { asm volatile("" : "+v"(v.x), "+v"(v.y)); }
+
+template <typename Y_T>
+__device__ __forceinline__ float4 grs_load_y4(const Y_T* y, int c)
+{
+    if constexpr (std::is_same_v<Y_T, half>)
+    {
+        const half2* y2 = (const half2*) (y + 4 * c);
+        float2 lo = __half22float2(y2[0]), hi = __half22float2(y2[1]);
+        return make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+    else return ((const float4*) y)[c];
+}
+
+__device__ __forceinline__ float4 grs_fma4(float p, float4 y, float4 x)
+{
+    return make_float4(fmaf(p, y.x, x.x), fmaf(p, y.y, x.y), fmaf(p, y.z, x.z), fmaf(p, y.w, x.w));
+}
+
+template <int H, int D, int LR, int R, bool POST, bool APPLY, typename Y_T, bool I8>
 __global__ __launch_bounds__(GRS_NT) __attribute__((amdgpu_waves_per_eu(8, 8)))
 void gr_site_kernel
 (
-    float* __restrict__ x,               // (H, D) raw streams, updated in place when APPLY
-    const Y_T* __restrict__ y,           // (D)
-    const float* __restrict__ pp,        // (H)
+    float* __restrict__ x,               // (R, H, D) raw streams, updated in place when APPLY
+    const Y_T* __restrict__ y,           // (R, D)
+    const float* __restrict__ pp,        // (R, H)
     const void* __restrict__ fn,         // (M, H * D) half, or int8 (I8)
-    const half* __restrict__ fn_s,       // (M, H * D / 128) group scales (I8)
+    const half* __restrict__ fn_s,       // (M, H * D / 128) (I8)
     const void* __restrict__ upt,        // (H, D / 4, LR, 4) half, or int8 (I8)
-    const half* __restrict__ upt_s,      // (H, D / 4, LR / 64, 4) group scales (I8)
+    const half* __restrict__ upt_s,      // (H, D / 4, LR / 64, 4) (I8)
     const half* __restrict__ w,          // (H * D)
-    float* __restrict__ dots,            // (M * H) workspace
-    float* __restrict__ post,            // (H) out (POST)
-    half* __restrict__ mixed,            // (D) out
-    unsigned* __restrict__ bar,          // (2) zero-initialised once
+    float* __restrict__ dots,            // (R, M + 1, H): rows j < M dots, row M sums of squares
+    float* __restrict__ post,            // (R, H) (POST)
+    half* __restrict__ mixed,            // (R, D)
+    unsigned* __restrict__ bar,
     const float rms_eps
 )
 {
     constexpr int M = LR + (POST ? H : 0);
-    constexpr int NPAIR = M * H;
     constexpr int D4 = D / 4;
-    constexpr int D8 = D / 8;
-    constexpr int KC = D8 / 32;          // 8-column chunks per lane per dot row
+    constexpr int KC = D / 8 / 32;       // fp16: 8 columns per int4
+    constexpr int KQ = D / 16 / 32;      // int8: 16 columns per int4
     constexpr int NIT = LR / 64;
-    static_assert(D8 % 32 == 0 && LR % 64 == 0, "shape");
+    constexpr int NBH = GRS_NB / H;        // blocks per stream
+    constexpr int MQ = 8;                // quads per block, at most
+    static_assert(D / 8 % 32 == 0 && LR % 64 == 0, "shape");
 
-    const int nb = gridDim.x;
+    const int nb = gridDim.x;            // == GRS_NB
     const int b = blockIdx.x;
     const int tid = threadIdx.x;
     const int lane = tid % 32;
     const int warp = tid / 32;
+    const int hb = b % H, bi = b / H;
 
-    __shared__ float4 sw4[H * D4];       // updated, weighted streams
-    __shared__ float t_s[LR];
-    __shared__ float red[H][GRS_NW];
-    __shared__ float rmr_s[H];
+    __shared__ float4 sw4[R][D4];                  // updated, weighted stream hb, all rows
+    __shared__ float t_s[R][LR];
+    __shared__ float4 xq_s[MQ][R][H];              // the quads' raw streams
+    __shared__ float4 yq_s[MQ][R];
+    __shared__ int2 usc_s[I8 ? MQ * H * NIT : 1];
+    __shared__ float red[R][GRS_NW];
+    __shared__ float rmr_s[R][H];
 
-    // Work split: pairs [p0, p1), quads [q0, q1); warp w takes pairs p0 + w, p0 + w + GRS_NW and quad q0 + w
-    const int p0 = (int) ((long) b * NPAIR / nb), p1 = (int) ((long) (b + 1) * NPAIR / nb);
-    const int q0 = (int) ((long) b * D4 / nb), q1 = (int) ((long) (b + 1) * D4 / nb);
-    const int pa = p0 + warp;
-    const bool has_a = pa < p1;
+    const int j0 = bi * M / NBH, j1 = (bi + 1) * M / NBH;
+    const int ja = j0 + warp;
+    const bool has_j = ja < j1;
+    const int jc = min(ja, M - 1);
+    const int q0 = b * D4 / nb, q1 = (b + 1) * D4 / nb;
     const int qc = q0 + warp;
-    const bool has_q = warp < 8 && qc < q1;
+    const bool has_q = warp < MQ && qc < q1;
+    const int qcl = min(qc, D4 - 1);
 
-    float ppr[H];
-    #pragma unroll
-    for (int h = 0; h < H; ++h) ppr[h] = APPLY ? pp[h] : 0.0f;
-
-    // Phase 0a: this thread's share of the stream stack (L2-resident), issued first so the stack can be built
-    // while the weight loads below are still in flight (vmcnt retires in issue order)
-    constexpr int SK = H * D4 / GRS_NT;
-    static_assert(H * D4 % GRS_NT == 0, "stack split");
-    float4 xs[SK], ys[SK];
-    half2 ws[SK][2];
-    #pragma unroll
-    for (int k = 0; k < SK; ++k)
-    {
-        const int i = tid + GRS_NT * k, h = i / D4, c = i % D4;
-        xs[k] = ((const float4*) x)[i];
-        const half2* w2 = (const half2*) (w + 4 * (size_t) i);
-        ws[k][0] = w2[0]; ws[k][1] = w2[1];
-        if constexpr (APPLY)
-        {
-            if constexpr (std::is_same_v<Y_T, half>)
-            {
-                const half2* y2 = (const half2*) (y + 4 * c);
-                float2 lo = __half22float2(y2[0]), hi = __half22float2(y2[1]);
-                ys[k] = make_float4(lo.x, lo.y, hi.x, hi.y);
-            }
-            else ys[k] = ((const float4*) y)[c];
-        }
-        (void) h;
-    }
-
-    // Phase 0b: weight loads (activation-independent)
-    // fp16: 8 columns per int4 (KC per lane); int8: 16 columns per int4 (KQ per lane), one scale per 128
-    constexpr int KQ = D / 16 / 32;
+    // Phase 0a: weights first (activation-independent): proj row jc of stream hb, up quads (warps < MQ)
     int4 fa[I8 ? KQ : KC];
     half fsc[I8 ? KQ : 1];
-    {
-        const int pc = min(pa, NPAIR - 1);
-        if constexpr (I8)
-        {
-            const int4* ra = (const int4*) ((const int8_t*) fn + (size_t) pc * D);
-            #pragma unroll
-            for (int k = 0; k < KQ; ++k) fa[k] = ra[lane + 32 * k];
-            #pragma unroll
-            for (int k = 0; k < KQ; ++k) fsc[k] = fn_s[(size_t) pc * (D / 128) + (lane + 32 * k) / 8];
-        }
-        else
-        {
-            const int4* ra = (const int4*) ((const half*) fn + (size_t) pc * D);
-            #pragma unroll
-            for (int k = 0; k < KC; ++k) fa[k] = ra[lane + 32 * k];
-        }
-    }
-    // up: lane ranks 2 lane + 64 it and the next, 4 columns: 16 bytes fp16 or 8 bytes int8 (scale per 64 ranks:
-    // one per (it, h, column), uniform across the warp)
-    int4 u[I8 ? 1 : NIT][H];
-    int2 u8[I8 ? NIT : 1][H];
-    __shared__ int2 usc_s[I8 ? 8 * H * NIT : 1];        // this block's up scales (<= 8 quads), 4 halves each
     if constexpr (I8)
     {
-        const int nq = q1 - q0;
-        if (tid < nq * H * NIT)
-        {
-            const int qi = tid / (H * NIT), r = tid % (H * NIT), h = r / NIT, it = r % NIT;
-            usc_s[tid] = *(const int2*) (upt_s + (((size_t) h * D4 + q0 + qi) * NIT + it) * 4);
-        }
+        const int4* ra = (const int4*) ((const int8_t*) fn + ((size_t) jc * H + hb) * D);
+        #pragma unroll
+        for (int k = 0; k < KQ; ++k) fa[k] = ra[lane + 32 * k];
+        #pragma unroll
+        for (int k = 0; k < KQ; ++k) fsc[k] = fn_s[((size_t) jc * H + hb) * (D / 128) + (lane + 32 * k) / 8];
     }
-    const int qcl = min(qc, D4 - 1);
-    if (warp < 8)
+    else
+    {
+        const int4* ra = (const int4*) ((const half*) fn + ((size_t) jc * H + hb) * D);
+        #pragma unroll
+        for (int k = 0; k < KC; ++k) fa[k] = ra[lane + 32 * k];
+    }
+    int4 u[I8 ? 1 : NIT][H];
+    int2 u8[I8 ? NIT : 1][H];
+    if (warp < MQ)
     {
         #pragma unroll
         for (int it = 0; it < NIT; ++it)
@@ -686,57 +669,83 @@ void gr_site_kernel
             for (int h = 0; h < H; ++h)
             {
                 const size_t e = (((size_t) h * D4 + qcl) * LR + 2 * lane + 64 * it) * 4;
-                if constexpr (I8)
-                {
-                    u8[it][h] = *(const int2*) ((const int8_t*) upt + e);
-                }
+                if constexpr (I8) u8[it][h] = *(const int2*) ((const int8_t*) upt + e);
                 else u[it][h] = *(const int4*) ((const half*) upt + e);
             }
     }
 
-    // Build the updated weighted stack + per-thread sums of squares
-    float ss[H] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    #pragma unroll
-    for (int k = 0; k < SK; ++k)
+    // Phase 0b: quad inputs and up scales into LDS
     {
-        const int i = tid + GRS_NT * k, h = i / D4;
-        float4 xv = xs[k];
-        float p = 0.0f;
-        #pragma unroll
-        for (int hh = 0; hh < H; ++hh) p = hh == h ? ppr[hh] : p;
-        if constexpr (APPLY)
+        const int nq = q1 - q0;
+        for (int i = tid; i < nq * R * (H + 1); i += GRS_NT)
         {
-            xv.x = fmaf(p, ys[k].x, xv.x); xv.y = fmaf(p, ys[k].y, xv.y);
-            xv.z = fmaf(p, ys[k].z, xv.z); xv.w = fmaf(p, ys[k].w, xv.w);
+            const int qi = i / (R * (H + 1)), rem = i % (R * (H + 1)), r = rem / (H + 1), h = rem % (H + 1);
+            if (h < H) xq_s[qi][r][h] = ((const float4*) (x + ((size_t) r * H + h) * D))[q0 + qi];
+            else if constexpr (APPLY) yq_s[qi][r] = grs_load_y4<Y_T>(y + (size_t) r * D, q0 + qi);
+        }
+        if constexpr (I8)
+            for (int i = tid; i < nq * H * NIT; i += GRS_NT)
+            {
+                const int qi = i / (H * NIT), rem = i % (H * NIT), h = rem / NIT, it = rem % NIT;
+                usc_s[i] = *(const int2*) (upt_s + (((size_t) h * D4 + q0 + qi) * NIT + it) * 4);
+            }
+    }
+
+    // Phase 0c: updated weighted stack of stream hb (all rows) + per-row sums of squares. Flat over (row,
+    // column quad) with every load issued before use (one L2 round trip, not one per row)
+    {
+        constexpr int K0 = (R * D4 + GRS_NT - 1) / GRS_NT;
+        float4 xv[K0], yv[K0];
+        #pragma unroll
+        for (int k = 0; k < K0; ++k)
+        {
+            const int i = min(tid + GRS_NT * k, R * D4 - 1), r = i / D4, c = i % D4;
+            xv[k] = ((const float4*) (x + ((size_t) r * H + hb) * D))[c];
+            if constexpr (APPLY) yv[k] = grs_load_y4<Y_T>(y + (size_t) r * D, c);
+        }
+        float ss[R];
+        #pragma unroll
+        for (int r = 0; r < R; ++r) ss[r] = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < K0; ++k)
+        {
+            const int i = tid + GRS_NT * k;
+            if (i >= R * D4) break;
+            const int r = i / D4, c = i % D4;
+            float4 v = xv[k];
+            if constexpr (APPLY) v = grs_fma4(pp[r * H + hb], yv[k], v);
+            const float sq = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, v.w * v.w)));
+            #pragma unroll
+            for (int rr = 0; rr < R; ++rr) if (rr == r) ss[rr] += sq;
+            const half2* w2 = (const half2*) (w + (size_t) hb * D + 4 * c);
+            float2 w01 = __half22float2(w2[0]), w23 = __half22float2(w2[1]);
+            sw4[r][c] = make_float4(__fmul_rn(v.x, w01.x), __fmul_rn(v.y, w01.y),
+                                    __fmul_rn(v.z, w23.x), __fmul_rn(v.w, w23.y));
         }
         #pragma unroll
-        for (int hh = 0; hh < H; ++hh)
-            if (hh == h) ss[hh] = fmaf(xv.x, xv.x, fmaf(xv.y, xv.y, fmaf(xv.z, xv.z, fmaf(xv.w, xv.w, ss[hh]))));
-        float2 w01 = __half22float2(ws[k][0]), w23 = __half22float2(ws[k][1]);
-        sw4[i] = make_float4(__fmul_rn(xv.x, w01.x), __fmul_rn(xv.y, w01.y),
-                             __fmul_rn(xv.z, w23.x), __fmul_rn(xv.w, w23.y));
-    }
-    #pragma unroll
-    for (int h = 0; h < H; ++h)
-    {
-        float v = hc_warp_sum_lane0(ss[h]);
-        if (lane == 0) red[h][warp] = v;
+        for (int r = 0; r < R; ++r)
+        {
+            const float v = hc_warp_sum_lane0(ss[r]);
+            if (lane == 0) red[r][warp] = v;
+        }
     }
     __syncthreads();
-    if (tid < H)
+    if (bi == 0 && tid < R)
     {
         float v = 0.0f;
         #pragma unroll
         for (int i = 0; i < GRS_NW; ++i) v += red[tid][i];
-        rmr_s[tid] = rsqrtf(v / (float) D + rms_eps);
+        __hip_atomic_store(dots + ((size_t) tid * (M + 1) + M) * H + hb, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
 
-    // Phase 1: dots for this warp's pairs (pair p = j * H + h: fn row j, stream h)
+    // Phase 1: R dots for proj row ja (stream hb)
     {
-        auto dot = [&](int p, int4* f) -> float
+        #pragma unroll 1
+        for (int r = 0; r < R; ++r)
         {
-            const int h = p % H;
-            const float4* s = sw4 + h * D4;
+            #pragma unroll
+            for (int k = 0; k < (I8 ? KQ : KC); ++k) grs_opaque(fa[k]);
+            const float4* s = sw4[r];
             float a = 0.0f;
             if constexpr (I8)
             {
@@ -744,7 +753,7 @@ void gr_site_kernel
                 for (int k = 0; k < KQ; ++k)
                 {
                     const int c16 = lane + 32 * k;
-                    const int* q4 = (const int*) &f[k];
+                    const int* q4 = (const int*) &fa[k];
                     float pk = 0.0f;
                     #pragma unroll
                     for (int v = 0; v < 4; ++v)
@@ -758,174 +767,233 @@ void gr_site_kernel
                     }
                     a = fmaf(__half2float(fsc[k]), pk, a);
                 }
-                return hc_warp_sum_lane0(a);
             }
-            #pragma unroll
-            for (int k = 0; k < KC; ++k)
+            else
             {
-                const int c8 = lane + 32 * k;
-                const float4 s0 = s[2 * c8], s1 = s[2 * c8 + 1];
-                const half2* f2 = (const half2*) &f[k];
-                float2 a01 = __half22float2(f2[0]), a23 = __half22float2(f2[1]);
-                float2 b01 = __half22float2(f2[2]), b23 = __half22float2(f2[3]);
-                a = fmaf(s0.x, a01.x, a); a = fmaf(s0.y, a01.y, a);
-                a = fmaf(s0.z, a23.x, a); a = fmaf(s0.w, a23.y, a);
-                a = fmaf(s1.x, b01.x, a); a = fmaf(s1.y, b01.y, a);
-                a = fmaf(s1.z, b23.x, a); a = fmaf(s1.w, b23.y, a);
+                #pragma unroll
+                for (int k = 0; k < KC; ++k)
+                {
+                    const int c8 = lane + 32 * k;
+                    const float4 s0 = s[2 * c8], s1 = s[2 * c8 + 1];
+                    const half2* f2 = (const half2*) &fa[k];
+                    float2 a01 = __half22float2(f2[0]), a23 = __half22float2(f2[1]);
+                    float2 b01 = __half22float2(f2[2]), b23 = __half22float2(f2[3]);
+                    a = fmaf(s0.x, a01.x, a); a = fmaf(s0.y, a01.y, a);
+                    a = fmaf(s0.z, a23.x, a); a = fmaf(s0.w, a23.y, a);
+                    a = fmaf(s1.x, b01.x, a); a = fmaf(s1.y, b01.y, a);
+                    a = fmaf(s1.z, b23.x, a); a = fmaf(s1.w, b23.y, a);
+                }
             }
-            return hc_warp_sum_lane0(a);
-        };
-        __syncthreads();
-        float da = dot(min(pa, NPAIR - 1), fa);
-        if (has_a && lane == 0) __hip_atomic_store(dots + pa, da, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    }
-
-    // Quad epilogue inputs (independent of the dots)
-    float4 xq[H];
-    half2 wq[H][2];
-    #pragma unroll
-    for (int h = 0; h < H; ++h)
-    {
-        xq[h] = ((const float4*) (x + (size_t) h * D))[qcl];
-        const half2* w2 = (const half2*) (w + (size_t) h * D + 4 * qcl);
-        wq[h][0] = w2[0]; wq[h][1] = w2[1];
-    }
-    if constexpr (APPLY)
-    {
-        float4 yv;
-        if constexpr (std::is_same_v<Y_T, half>)
-        {
-            const half2* y2 = (const half2*) (y + 4 * qcl);
-            float2 lo = __half22float2(y2[0]), hi = __half22float2(y2[1]);
-            yv = make_float4(lo.x, lo.y, hi.x, hi.y);
-        }
-        else yv = ((const float4*) y)[qcl];
-        #pragma unroll
-        for (int h = 0; h < H; ++h)
-        {
-            xq[h].x = fmaf(ppr[h], yv.x, xq[h].x); xq[h].y = fmaf(ppr[h], yv.y, xq[h].y);
-            xq[h].z = fmaf(ppr[h], yv.z, xq[h].z); xq[h].w = fmaf(ppr[h], yv.w, xq[h].w);
+            a = hc_warp_sum_lane0(a);
+            if (has_j && lane == 0) __hip_atomic_store(dots + ((size_t) r * (M + 1) + ja) * H + hb, a, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         }
     }
 
     grs_grid_barrier(bar, nb);
 
-    // Phase 2: t from the dots (fixed order, every block the same)
-    const float inv_h = 1.0f / (float) H;
-    for (int i = tid; i < LR; i += GRS_NT)
+    // Phase 2: rmr and t for every row (fixed order, every block the same); each thread's dots rows are
+    // loaded before the rmr wait
+    constexpr int KT = (R * LR + GRS_NT - 1) / GRS_NT;
+    float4 dv[KT];
+    #pragma unroll
+    for (int k = 0; k < KT; ++k)
     {
-        float v = 0.0f;
-        #pragma unroll
-        for (int h = 0; h < H; ++h) v = fmaf(rmr_s[h], __hip_atomic_load(dots + i * H + h, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), v);
-        v *= inv_h;
-        t_s[i] = v * sigmoidf_(v);
+        const int i = min(tid + GRS_NT * k, R * LR - 1), r = i / LR, l = i % LR;
+        const float* dp = dots + ((size_t) r * (M + 1) + l) * H;
+        dv[k] = make_float4(__hip_atomic_load(dp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT),
+                            __hip_atomic_load(dp + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT),
+                            __hip_atomic_load(dp + 2, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT),
+                            __hip_atomic_load(dp + 3, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
     }
-    if (POST && b == 0 && tid < H)
+    if (tid < R * H)
     {
+        const int r = tid / H, h = tid % H;
+        rmr_s[r][h] = rsqrtf(__hip_atomic_load(dots + ((size_t) r * (M + 1) + M) * H + h, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) / (float) D + rms_eps);
+    }
+    __syncthreads();
+    const float inv_h = 1.0f / (float) H;
+    #pragma unroll
+    for (int k = 0; k < KT; ++k)
+    {
+        const int i = tid + GRS_NT * k;
+        if (i >= R * LR) break;
+        const int r = i / LR, l = i % LR;
+        float v = fmaf(rmr_s[r][3], dv[k].w, fmaf(rmr_s[r][2], dv[k].z, fmaf(rmr_s[r][1], dv[k].y, rmr_s[r][0] * dv[k].x)));
+        v *= inv_h;
+        t_s[r][l] = v * sigmoidf_(v);
+    }
+    if (POST && b == 0 && tid < R * H)
+    {
+        const int r = tid / H, hh = tid % H;
+        const float* dr = dots + (size_t) r * (M + 1) * H;
         float v = 0.0f;
         #pragma unroll
-        for (int h = 0; h < H; ++h) v = fmaf(rmr_s[h], __hip_atomic_load(dots + (LR + tid) * H + h, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), v);
-        post[tid] = 2.0f * sigmoidf_(v * inv_h);
+        for (int h = 0; h < H; ++h) v = fmaf(rmr_s[r][h], __hip_atomic_load(dr + (LR + hh) * H + h, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), v);
+        post[r * H + hh] = 2.0f * sigmoidf_(v * inv_h);
     }
     __syncthreads();
     if (!has_q) return;
 
-    float g[H][4];
-    #pragma unroll
-    for (int h = 0; h < H; ++h) g[h][0] = g[h][1] = g[h][2] = g[h][3] = 0.0f;
-    #pragma unroll
-    for (int it = 0; it < NIT; ++it)
+    // One warp per column quad, rows in pairs: g[rl][h][e] for the pair (up unpacked once per pair), then a
+    // reduce-scatter over the 32 lanes leaves lane l with the full sum of value l = (rl, h, e); every lane finishes
+    // its own value (sigmoid, gate, weight), the stream sum runs over lane bits 2-3 (fixed order) and lanes with
+    // h = 0 write mixed; each lane writes its updated stream value back
+    const int qi = warp;
+    const int le = lane & 3, lh = (lane >> 2) & 3, lrl = lane >> 4;
+    const float wl = __half2float(w[(size_t) lh * D + 4 * qc + le]);
+    #pragma unroll 1
+    for (int r0 = 0; r0 < R; r0 += 2)
     {
-        const float t0 = t_s[2 * lane + 64 * it];
-        const float t1 = t_s[2 * lane + 64 * it + 1];
-        if constexpr (I8)
-        {
+        const int nr = min(2, R - r0);
+        float g[32];
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) g[i] = 0.0f;
+        #pragma unroll
+        for (int it = 0; it < NIT; ++it)
             #pragma unroll
             for (int h = 0; h < H; ++h)
             {
-                const int qa = u8[it][h].x, qb = u8[it][h].y;      // rank i: 4 columns, rank i + 1: 4 columns
-                const int2 usv = usc_s[(warp * H + h) * NIT + it];
-                const half2* us2 = (const half2*) &usv;
-                const float2 s01 = __half22float2(us2[0]), s23 = __half22float2(us2[1]);
-                const float sc[4] = { s01.x, s01.y, s23.x, s23.y };
-                #pragma unroll
-                for (int e = 0; e < 4; ++e)
-                {
-                    const float pe = fmaf(t1, (float) (int8_t) (qb >> (8 * e)), t0 * (float) (int8_t) (qa >> (8 * e)));
-                    g[h][e] = fmaf(sc[e], pe, g[h][e]);
-                }
+                if constexpr (I8) grs_opaque(u8[it][h]);
+                else grs_opaque(u[it][h]);
             }
-            continue;
-        }
         #pragma unroll
-        for (int h = 0; h < H; ++h)
+        for (int it = 0; it < NIT; ++it)
         {
-            const half2* u2 = (const half2*) &u[it][h];
-            float2 a01 = __half22float2(u2[0]), a23 = __half22float2(u2[1]);
-            float2 b01 = __half22float2(u2[2]), b23 = __half22float2(u2[3]);
-            g[h][0] = fmaf(t1, b01.x, fmaf(t0, a01.x, g[h][0]));
-            g[h][1] = fmaf(t1, b01.y, fmaf(t0, a01.y, g[h][1]));
-            g[h][2] = fmaf(t1, b23.x, fmaf(t0, a23.x, g[h][2]));
-            g[h][3] = fmaf(t1, b23.y, fmaf(t0, a23.y, g[h][3]));
+            float t0[2], t1[2];
+            #pragma unroll
+            for (int rl = 0; rl < 2; ++rl)
+            {
+                const int r = min(r0 + rl, R - 1);
+                t0[rl] = t_s[r][2 * lane + 64 * it];
+                t1[rl] = t_s[r][2 * lane + 64 * it + 1];
+            }
+            #pragma unroll
+            for (int h = 0; h < H; ++h)
+            {
+                float ua[4], ub[4];
+                if constexpr (I8)
+                {
+                    const int qa = u8[it][h].x, qb = u8[it][h].y;
+                    const int2 usv = usc_s[(qi * H + h) * NIT + it];
+                    const half2* us2 = (const half2*) &usv;
+                    const float2 s01 = __half22float2(us2[0]), s23 = __half22float2(us2[1]);
+                    const float sc[4] = { s01.x, s01.y, s23.x, s23.y };
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        ua[e] = sc[e] * (float) (int8_t) (qa >> (8 * e));
+                        ub[e] = sc[e] * (float) (int8_t) (qb >> (8 * e));
+                    }
+                }
+                else
+                {
+                    const half2* u2 = (const half2*) &u[it][h];
+                    float2 a01 = __half22float2(u2[0]), a23 = __half22float2(u2[1]);
+                    float2 b01 = __half22float2(u2[2]), b23 = __half22float2(u2[3]);
+                    ua[0] = a01.x; ua[1] = a01.y; ua[2] = a23.x; ua[3] = a23.y;
+                    ub[0] = b01.x; ub[1] = b01.y; ub[2] = b23.x; ub[3] = b23.y;
+                }
+                #pragma unroll
+                for (int rl = 0; rl < 2; ++rl)
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        float& gg = g[(rl * H + h) * 4 + e];
+                        gg = fmaf(t1[rl], ub[e], fmaf(t0[rl], ua[e], gg));
+                    }
+            }
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        // reduce-scatter: after offset o, lanes with bit o set keep the upper half of the remaining values
+        #define RS_STEP(O, N) \
+            { const bool up = (lane & O) != 0; \
+              _Pragma("unroll") for (int i = 0; i < N / 2; ++i) { \
+                const float keep = up ? g[i + N / 2] : g[i]; const float send = up ? g[i] : g[i + N / 2]; \
+                g[i] = keep + ((O) == 16 ? hc_permlanex16(send) : hc_xor16<(O) == 16 ? 1 : (O)>(send)); } }
+        RS_STEP(16, 32)
+        RS_STEP(8, 16)
+        RS_STEP(4, 8)
+        RS_STEP(2, 4)
+        RS_STEP(1, 2)
+        #undef RS_STEP
+        // lane l now holds the full g of value l = (lrl, lh, le)
+        const int r = r0 + lrl;
+        const bool live = lrl < nr;
+        const int rc = min(r, R - 1);
+        float sv = ((const float*) &xq_s[qi][rc][lh])[le];
+        if constexpr (APPLY) sv = fmaf(pp[rc * H + lh], ((const float*) &yq_s[qi][rc])[le], sv);
+        float term = sigmoidf_(g[0]) * (rmr_s[rc][lh] * inv_h) * wl * sv;
+        term += hc_xor16<4>(term);
+        term += hc_xor16<8>(term);
+        if (live)
+        {
+            if constexpr (APPLY) x[((size_t) r * H + lh) * D + 4 * qc + le] = sv;
+            if (lh == 0) mixed[(size_t) r * D + 4 * qc + le] = __float2half_rn(term);
         }
     }
-    #pragma unroll
-    for (int h = 0; h < H; ++h)
-        #pragma unroll
-        for (int e = 0; e < 4; ++e) g[h][e] = grs_xor_sum32(g[h][e]);
-    if (lane != 0) return;
-
-    float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    #pragma unroll
-    for (int h = 0; h < H; ++h)
-    {
-        const float4 sv = xq[h];
-        const float coef = rmr_s[h] * inv_h;
-        float2 w01 = __half22float2(wq[h][0]), w23 = __half22float2(wq[h][1]);
-        o.x = fmaf(sigmoidf_(g[h][0]) * coef * w01.x, sv.x, o.x);
-        o.y = fmaf(sigmoidf_(g[h][1]) * coef * w01.y, sv.y, o.y);
-        o.z = fmaf(sigmoidf_(g[h][2]) * coef * w23.x, sv.z, o.z);
-        o.w = fmaf(sigmoidf_(g[h][3]) * coef * w23.y, sv.w, o.w);
-        if constexpr (APPLY) ((float4*) (x + (size_t) h * D))[qc] = sv;
-    }
-    half2* out2 = (half2*) mixed;
-    out2[qc * 2] = __floats2half2_rn(o.x, o.y);
-    out2[qc * 2 + 1] = __floats2half2_rn(o.z, o.w);
 }
 
-// Launch a site kernel on a grid of co-resident blocks: as many as the device holds at once (occupancy x
-// multiprocessors; gfx11 reports WGPs), capped at 96. The work split needs >= 81 blocks; false otherwise.
+
+// Launch a site kernel on its fixed grid of GRS_NB blocks, which must all be co-resident (the grid barrier):
+// false (nothing launched) when the device holds fewer
 template <typename K, typename Y_T>
 static bool gr_site_launch(K kernel, float* x, const Y_T* y, const float* pp, const void* fn, const half* fn_s,
                            const void* upt, const half* upt_s, const half* w, float* dots, float* post, half* mixed,
                            unsigned* bar, float eps, cudaStream_t stream)
 {
     int dev; cudaGetDevice(&dev);
-    static int nbs[16][8] = { { 0 } };
+    static int caps[16][32] = { { 0 } };
     static int slot_next = 0;
-    static const void* slots[8] = { nullptr };
+    static const void* slots[32] = { nullptr };
     int slot = -1;
     for (int i = 0; i < slot_next; ++i) if (slots[i] == (const void*) kernel) slot = i;
-    if (slot < 0) { slot = slot_next++; slots[slot] = (const void*) kernel; }
-    if (!nbs[dev][slot])
+    if (slot < 0) { if (slot_next == 32) return false; slot = slot_next++; slots[slot] = (const void*) kernel; }
+    if (!caps[dev][slot])
     {
         cudaDeviceProp p; cudaGetDeviceProperties(&p, dev);
-        // HIP's occupancy query does not model gfx11 WGP mode (it reports WGPs as multiprocessors but sizes
-        // LDS and VGPRs against one CU) and returns 0 for this kernel. A WGP holds two of its blocks when each
-        // fits one CU: 16 wave32 waves over 2 SIMDs at <= 192 VGPRs (1536 per SIMD lane on gfx1100) and <= 64 KB
-        // of LDS. Measured: 96 blocks run co-resident on gfx1100's 48 WGPs (the barrier completes)
+        // HIP's occupancy query does not model gfx11 WGP mode (it reports WGPs as multiprocessors and sizes
+        // LDS and VGPRs against one CU). A WGP holds two of these blocks when each fits one CU: 16 wave32 waves
+        // over 2 SIMDs at <= 192 VGPRs (1536 per SIMD lane on gfx1100) and <= 64 KB of LDS. Measured: 96 blocks
+        // run co-resident on gfx1100's 48 WGPs (the barrier completes)
         cudaFuncAttributes fa; cudaFuncGetAttributes(&fa, (const void*) kernel);
         int per = 0;
         if (strncmp(p.gcnArchName, "gfx11", 5) == 0 && fa.numRegs <= 192 && fa.sharedSizeBytes <= 65536) per = 2;
         else cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kernel, GRS_NT, 0);
-        nbs[dev][slot] = std::min(96, per * p.multiProcessorCount);
-        if (nbs[dev][slot] < 81) nbs[dev][slot] = -1;
+        caps[dev][slot] = per * p.multiProcessorCount >= GRS_NB ? 1 : -1;
     }
-    const int nb = nbs[dev][slot];
-    if (nb < 0) return false;
-    kernel<<<nb, GRS_NT, 0, stream>>>(x, y, pp, fn, fn_s, upt, upt_s, w, dots, post, mixed, bar, eps);
+    if (caps[dev][slot] < 0) return false;
+    kernel<<<GRS_NB, GRS_NT, 0, stream>>>(x, y, pp, fn, fn_s, upt, upt_s, w, dots, post, mixed, bar, eps);
     cuda_check(cudaPeekAtLastError());
     return true;
+}
+
+// Site kernel dispatch over rows (1..4), form, apply and y dtype
+template <bool I8>
+static bool gr_site_dispatch
+(
+    int R, float* s_p, const void* py, bool y_half, const float* ppost, const void* fn, const half* fn_s,
+    const void* upt, const half* upt_s, const half* w_p, float* dots_p, float* post_p, half* mixed_p,
+    unsigned* bar, float eps, cudaStream_t stream
+)
+{
+    const bool apply = py != nullptr;
+    bool done = false;
+    #define SITE(R_, POST_, AP, Y_T) done = gr_site_launch(gr_site_kernel<4, 2560, 320, R_, POST_, AP, Y_T, I8>, \
+        s_p, (const Y_T*) py, ppost, fn, fn_s, upt, upt_s, w_p, dots_p, post_p, mixed_p, bar, eps, stream)
+    #define SITE_P(R_, POST_) if (!apply) SITE(R_, POST_, false, float); else if (y_half) SITE(R_, POST_, true, half); else SITE(R_, POST_, true, float);
+    #define SITE_R(R_) if (post_p) { SITE_P(R_, true) } else { SITE_P(R_, false) }
+    switch (R)
+    {
+        case 1: SITE_R(1) break;
+        case 2: SITE_R(2) break;
+        case 3: SITE_R(3) break;
+        case 4: SITE_R(4) break;
+        default: break;
+    }
+    #undef SITE_R
+    #undef SITE_P
+    #undef SITE
+    return done;
 }
 
 // The pipelined pair for the shapes it is instantiated for; false (nothing launched) otherwise. y_half: the
@@ -945,18 +1013,10 @@ static bool gr_mix_rdna_try
 
     // One persistent launch per site at R = 1 (needs the barrier words and a grid of >= 81 co-resident blocks)
     static const bool site_off = [] { const char* e = getenv("EXL3_GR_SITE"); return e && e[0] == '0'; }();
-    if (!site_off && bar && R == 1 && half_out && D == 2560 && LR == 320)
-    {
-        const bool apply = py != nullptr;
-        bool done = false;
-        #define SITE(POST_, AP, Y_T) done = gr_site_launch(gr_site_kernel<4, 2560, 320, POST_, AP, Y_T, false>, \
-            s_p, (const Y_T*) py, ppost, fn_p, nullptr, upt_p, nullptr, w_p, dots_p, post_p, (half*) mixed_p, bar, rms_eps, stream)
-        #define SITE_P(POST_) if (!apply) SITE(POST_, false, float); else if (y_half) SITE(POST_, true, half); else SITE(POST_, true, float);
-        if (post_p) { SITE_P(true) } else { SITE_P(false) }
-        #undef SITE_P
-        #undef SITE
-        if (done) return true;
-    }
+    if (!site_off && bar && R >= 1 && R <= 4 && half_out && D == 2560 && LR == 320 &&
+        gr_site_dispatch<false>(R, s_p, py, y_half, ppost, fn_p, nullptr, upt_p, nullptr, w_p, dots_p, post_p,
+                                (half*) mixed_p, bar, rms_eps, stream))
+        return true;
     const int D8 = D / 8;
     if (D % 16 || (LR != 320 && LR != 512)) return false;
     int nt = 0, ni = 0;
@@ -1000,7 +1060,7 @@ static bool gr_mix_rdna_try
 
 
 // Site kernel with int8 tables (symmetric absmax, one fp16 scale per 128 proj columns along H * D and per 64 up
-// ranks per output channel; GatedResidual quantizes them at load under EXL3_GR_I8). R = 1, the Qwen3.8 shape
+// ranks per output channel; GatedResidual quantizes them at load under EXL3_GR_I8). R <= 2, the Qwen3.8 shape
 // only; false (nothing launched) otherwise, and the caller takes the fp16 path.
 static bool gr_site_i8_try
 (
@@ -1010,14 +1070,9 @@ static bool gr_site_i8_try
     const int LR, const int D, const int R, const float rms_eps, cudaStream_t stream
 )
 {
-    if (R != 1 || D != 2560 || LR != 320 || !bar) return false;
-    const bool apply = py != nullptr;
-    bool done = false;
-    #define SITE(POST_, AP, Y_T) done = gr_site_launch(gr_site_kernel<4, 2560, 320, POST_, AP, Y_T, true>, \
-        s_p, (const Y_T*) py, ppost, fn_q, fn_s, upt_q, upt_s, w_p, dots_p, post_p, mixed_p, bar, rms_eps, stream)
-    #define SITE_P(POST_) if (!apply) SITE(POST_, false, float); else if (y_half) SITE(POST_, true, half); else SITE(POST_, true, float);
-    if (post_p) { SITE_P(true) } else { SITE_P(false) }
-    #undef SITE_P
-    #undef SITE
-    return done;
+    // R <= 2 only: at 3-4 rows the int8 unpacking costs more than the bytes it saves (fp16 31.9 vs int8 34.2 us
+    // at R = 4 in the micro-benchmark)
+    if (R < 1 || R > 2 || D != 2560 || LR != 320 || !bar) return false;
+    return gr_site_dispatch<true>(R, s_p, py, y_half, ppost, fn_q, fn_s, upt_q, upt_s, w_p, dots_p, post_p, mixed_p,
+                                  bar, rms_eps, stream);
 }
