@@ -438,10 +438,20 @@ class Generator:
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
 
-        # Sparse drafting head over a frequency-selected vocabulary subset (layer-split mode only)
+        # Sparse drafting head over a frequency-selected vocabulary subset. Tensor-parallel targets get one
+        # local to the output device, filled from the ranks that own the columns (make_tp_sparse_head)
         self.sparse_head = None
         self._sparse_flag = False
-        if sparse_draft_head and self.draft_model is not None and not model.loaded_tp:
+        if sparse_draft_head and self.draft_model is not None and model.loaded_tp \
+                and getattr(self.draft_model, "sparse_head_linear", None) is None:
+            from ..modules.sparse_head import token_stats_path
+            self.sparse_head = model.make_tp_sparse_head(
+                sparse_draft_head,
+                profile_path = token_stats_path(model.config.directory, model.config.vocab_size),
+                with_embedding = self.mtp_draft,
+            )
+            self.sparse_head.benchmark(full_fn = lambda x: model.lm_head_argmax(x, {}))
+        elif sparse_draft_head and self.draft_model is not None and not model.loaded_tp:
             from ..modules.sparse_head import token_stats_path
             # Drafters with a head of their own (Gemma4 assistant) take the subset there; the others borrow the
             # target's head and the subset mirrors it

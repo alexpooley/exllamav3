@@ -59,6 +59,7 @@ class Model_TPMixin:
         self.loaded_tp = False
         self.tp_output_device = None
         self.tp_producer = None
+        self.tp_sparse_head = None
         self.tp_backend = None
         # Devices whose per-forward None acks are still in flight (see forward_tp), and a strong
         # reference to the dispatched args for that pass: pickling CPU tensors (e.g. exported
@@ -378,6 +379,66 @@ class Model_TPMixin:
         return r
 
 
+    def tp_lm_head_columns(self, ids: torch.Tensor, out: torch.Tensor):
+        """
+        LM-head columns (in_features, len(ids)) for global vocabulary ids, written into out (on any device):
+        each rank owning part of the head reconstructs its own ids. Used to fill a sparse drafting head on the
+        output device, so it is called on subset rebuilds only
+        """
+        ids_l = ids.tolist()
+        for device in self.active_devices:
+            a, b, _ = self.plan[device]["lm_head"]
+            sel = [j for j, v in enumerate(ids_l) if a <= v < b]
+            if not sel:
+                continue
+            w = self.tp_worker_dispatch_single(device, mp_lm_head_columns, ([ids_l[j] for j in sel], a))
+            if not isinstance(w, torch.Tensor):
+                w = torch.from_numpy(w)
+            out[:, torch.tensor(sel, dtype = torch.long, device = out.device)] = w.to(out.device)
+
+
+    def make_tp_sparse_head(self, capacity: int, profile_path: str | None, with_embedding: bool):
+        """
+        Sparse drafting head for a tensor-parallel target, local to the output device (where the drafter and
+        the head\'s argmax run): its columns are pulled from the ranks that own them at each subset rebuild, so
+        a draft step costs one local GEMV instead of a TP dispatch of the full head
+        """
+        from ..modules.sparse_head import SparseHead
+        lm = self.modules[self.logit_layer_idx]
+        model = self
+
+        class _Inner:
+            def get_bias_tensor(self):
+                return None
+            def reconstruct_columns(self, ids, out):
+                model.tp_lm_head_columns(ids, out)
+
+        class _HeadProxy:
+            def __init__(self):
+                self.device = torch.device(f"cuda:{model.tp_output_device}")
+                self.in_features = lm.in_features
+                self.key = lm.key
+                self.config = model.config
+                self.pre_scale = lm.pre_scale
+                self.post_scale = lm.post_scale
+                self.softcap = lm.softcap
+                self.inner = _Inner()
+
+        class _EmbeddingProxy:
+            hidden_size = self.config.hidden_size
+            def forward(self, ids, params, out_dtype = None):
+                x = model.tp_producer.send(ids)
+                return model.tp_dispatch_master(mp_model_forward_embedding, (x, {})).half()
+
+        sh = SparseHead(
+            _HeadProxy(), capacity, self.config.vocab_size,
+            profile_path = profile_path,
+            embedding = _EmbeddingProxy() if with_embedding else None,
+        )
+        self.tp_sparse_head = sh
+        return sh
+
+
     def tp_dispatch_lm_head_argmax(self, args, return_max: bool = False):
         """
         Compute argmax over a tensor-parallel sharded LM head.
@@ -657,6 +718,7 @@ class Model_TPMixin:
             return
         self.destroy_tp_context()
         self.loaded_tp = False
+        self.tp_sparse_head = None
         self.tp_output_device = None
         cleanupper.unregister_atexit(self.destroy_tp_context)
 

@@ -303,6 +303,26 @@ def mp_model_forward_embedding(
     return x
 
 
+def mp_lm_head_columns(
+    local_context: dict,
+    ids: list,
+    offset: int,
+):
+    """
+    Original-basis LM-head columns (in_features, len(ids)) for vocabulary ids inside this rank's head slice
+    (starting at offset), for a sparse drafting head built on another device. The output-device rank (in the
+    main process) hands back its CUDA tensor; spawned ranks return a host array (no tensor crosses the pipe)
+    """
+    module = local_context["logits_module"]
+    device = local_context["device"]
+    idx = torch.tensor([i - offset for i in ids], dtype = torch.long, device = device)
+    w = torch.empty((module.in_features, len(ids)), dtype = torch.half, device = device)
+    module.inner.reconstruct_columns(idx, w)
+    if device == local_context["output_device"]:
+        return w
+    return w.cpu().numpy()
+
+
 def mp_model_forward_lm_head_argmax(
     local_context: dict,
     shared_input: dict,

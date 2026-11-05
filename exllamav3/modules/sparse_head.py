@@ -394,11 +394,14 @@ class SparseHead:
 
     # Cost model
 
-    def benchmark(self, iters: int = 20):
-        """Time one full-head and one sparse argmax at batch size 1 on the head's device"""
+    def benchmark(self, iters: int = 20, full_fn = None):
+        """Time one full-head and one sparse argmax at batch size 1 on the head's device; full_fn(x) replaces
+        the full head's argmax (a tensor-parallel head, which has no local forward)"""
         lin = self.linear
         x = torch.randn((1, 1, self.k), dtype = torch.half, device = self.device)
         def full():
+            if full_fn is not None:
+                return full_fn(x)
             logits = lin.forward(x, {})
             return torch.argmax(logits, dim = -1)
         def timed(fn):

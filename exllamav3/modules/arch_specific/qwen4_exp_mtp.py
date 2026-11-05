@@ -154,6 +154,9 @@ class Qwen4ExpMTPInputLayer(Module):
         # Token embedding via the attached model (in the TP output worker when the target is TP)
         if not self.attached_model().loaded_tp:
             emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
+        elif params.get("draft_embedding") is not None and tuple(params["draft_embedding"].shape[:-1]) == tuple(x.shape):
+            # The sparse draft head returned the winners' embedding rows: no lookup dispatch
+            emb = params["draft_embedding"].half()
         else:
             emb = self.attached_model().tp_producer.send(x)
             emb = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (emb, params)).half()

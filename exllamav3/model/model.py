@@ -401,8 +401,22 @@ class Model(Model_TPMixin, Model_LSMixin):
         """
         export = bool(params.get("export_draft_conf"))
         if self.loaded_tp:
+            # Draft-only sparse subset on the output device (make_tp_sparse_head): no TP dispatch per step
+            sh = self.tp_sparse_head
+            flag = params.get("sparse_head") if sh is not None else None
+            if flag is True and sh.ready:
+                ids, conf, emb = sh.argmax(state.to(sh.device), embedding = True)
+                if export:
+                    params["draft_conf"] = conf
+                if emb is not None:
+                    params["draft_embedding"] = emb
+                return ids
+            local = state
             state = self.tp_producer.send(state)
             ids, conf = self.tp_dispatch_lm_head_argmax((state, {}), return_max = True)
+            if flag == "probe":
+                sparse_ids, _ = sh.argmax(local.to(sh.device))
+                sh.record_probe(ids.to(sh.device), sparse_ids)
             if export:
                 params["draft_conf"] = conf
             return ids
