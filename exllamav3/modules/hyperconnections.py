@@ -39,6 +39,17 @@ def hc_flush(params: dict):
 # "hc_pending" one with comb None, so every hc_flush point (device moves, PLE, HyperHead) lands it as well
 _gr_fold = os.environ.get("EXL3_GR_FOLD", "1" if torch.version.hip else "0") != "0"
 
+# Grid-barrier words for the one-launch GatedResidual decode site (gr_mix on ROCm), one zeroed pair per device;
+# the kernel leaves them as it found them, so graph replays and every site share them
+_gr_site_bars = {}
+
+
+def _gr_site_bar(dev: torch.device):
+    b = _gr_site_bars.get(dev)
+    if b is None:
+        b = _gr_site_bars[dev] = torch.zeros(2, dtype = torch.int32, device = dev)
+    return b
+
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
 # the embedding into the streams, each sublayer site mixes them through a HyperConnection
@@ -625,7 +636,8 @@ class GatedResidual(Module):
                     post = torch.empty((R, H), dtype = torch.float, device = dev)
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
             ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed,
-                       pend[1] if pend is not None else None, pend[2] if pend is not None else None)
+                       pend[1] if pend is not None else None, pend[2] if pend is not None else None,
+                       _gr_site_bar(dev))
         elif self.tiled:
             # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
             # reuses segments across chunk sizes), never statics
