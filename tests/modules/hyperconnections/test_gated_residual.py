@@ -218,8 +218,8 @@ def test_weighted_copy_handoff(device, D, rank, monkeypatch):
         assert rel(mixed_h, mixed_k) < 1e-3, R
         assert rel(post_h, post_k) < 1e-4, R
         # and the kernel really reads the copy: a poisoned one changes the gates (except the one-launch ROCm
-        # site kernel at R = 1, which weighs the raw streams itself and ignores the copy)
-        if R == 1 and torch.version.hip and (D, rank) == (2560, 320):
+        # site kernel at R <= 4, which weighs the raw streams itself and ignores the copy)
+        if R <= 4 and torch.version.hip and (D, rank) == (2560, 320):
             continue
         a.apply_(x, torch.zeros_like(y), post, None, params)
         params["gr_weighted"][2].mul_(0.0)
@@ -334,15 +334,16 @@ def test_folded_apply_flush(device, monkeypatch):
 
 
 @pytest.mark.parametrize("use_combine", [True, False])
-def test_site_kernel_r1(device, use_combine):
-    # R = 1 on the Qwen3.8 shape takes the one-launch site kernel on ROCm: reference agreement, bits run to run
+@pytest.mark.parametrize("R", [1, 2, 3, 4])
+def test_site_kernel_r1(device, use_combine, R):
+    # R <= 4 on the Qwen3.8 shape takes the one-launch site kernel on ROCm: reference agreement, bits run to run
     m = make_site(device, 2560, 320, use_combine)
-    x = torch.randn(1, 1, 4, 2560, device = device) * 3.0
+    x = torch.randn(1, R, 4, 2560, device = device) * 3.0
     ref_post, ref_mixed = m._mix_ref(x)
     outs = [m._mix(x.clone(), cached = False) for _ in range(3)]
-    assert rel(outs[0][1], ref_mixed.view(1, 2560)) < 3e-3
+    assert rel(outs[0][1], ref_mixed.view(R, 2560)) < 3e-3
     if use_combine:
-        assert rel(outs[0][0], ref_post.view(1, 4)) < 1e-3
+        assert rel(outs[0][0], ref_post.view(R, 4)) < 1e-3
     for o in outs[1:]:
         assert torch.equal(o[1], outs[0][1]) and (not use_combine or torch.equal(o[0], outs[0][0]))
 
@@ -385,7 +386,7 @@ def test_site_kernel_i8(device, use_combine, monkeypatch):
     assert torch.equal(outs[0][1], outs[1][1]) and torch.equal(outs[0][0], outs[1][0])
 
 
-@pytest.mark.parametrize("R", [1])
+@pytest.mark.parametrize("R", [1, 2, 3, 4])
 def test_site_kernel_repeated_launch_determinism(device, R):
     # The site kernel's grid barrier once released early about once per 250 launches (a stale generation read):
     # 64000 launches on fixed inputs must all produce the same bits. Batches of 64 output slots, compared per batch.
