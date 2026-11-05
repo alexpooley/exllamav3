@@ -109,5 +109,9 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
 )
 .def_readonly("sh_coop", &BC_BlockSparseMLP::sh_coop)
 .def("run_bszN", &BC_BlockSparseMLP::run_bszN)
+.def("persist_prepare", &BC_BlockSparseMLP::persist_prepare)
+.def("run_persist", &BC_BlockSparseMLP::run_persist)
+.def("persist_sel", [](BC_BlockSparseMLP& s) { return s.p_sel; })
+.def("persist_ctr", [](BC_BlockSparseMLP& s) { return s.p_ctr; })
 .def("run_single_expert", &BC_BlockSparseMLP::run_single_expert)
 .def("run_single_expert_dq", &BC_BlockSparseMLP::run_single_expert_dq);

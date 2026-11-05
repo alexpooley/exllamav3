@@ -70,6 +70,8 @@ class ExpertsCFG:
 
 # Debug: replicate the router on every TP rank and compare local vs broadcast selections
 _routing_check = os.environ.get("EXL3_TP_ROUTING_CHECK", "0") != "0"
+# Persistent one-launch MoE block at bsz 1 (ROCm prototype, exl3_rocm_moe_persist)
+_moe_persist = os.environ.get("EXL3_ROCM_MOE_PERSIST", "0") != "0"
 # Shared expert as a one-expert fused decode launch (see BC_BlockSparseMLP::sh_coop); 0 keeps the
 # three-launch BC_GatedMLP graph
 _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
@@ -482,6 +484,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.register_submodule(self.routed_post_norm)
 
         self.bc = None
+        self._persist = None
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
         self.mtile_ok = False
@@ -1021,6 +1024,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     def unload(self):
         self.cpu_unload()
         self.bc = None
+        self._persist = None
         self.fused_mode_buffers = None
         self.batch_recon = None
         if self.multi_gate is not None:
@@ -1069,6 +1073,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
         bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+
+        # Persistent one-launch block (ROCm, bsz 1): router, top-k, routed and shared experts, sigmoid gate and
+        # sum in one kernel (exl3_rocm_moe_persist). EXL3_ROCM_MOE_PERSIST=1 enables it
+        if bsz == 1 and _moe_persist and self.bc is not None and not params.get("activate_all_experts") \
+                and "capture_sens" not in params and not params.get("tp_warmup") and not params.get("autosplit_measure"):
+            if self._persist is None:
+                self._persist = self._persist_setup()
+            if self._persist:
+                final_hidden_states = self.bc.run_persist(y).view(eshape)
+                if out_dtype is not None:
+                    final_hidden_states = final_hidden_states.to(out_dtype)
+                return final_hidden_states
 
         # Routing
         if self.router_pre_norm:
@@ -1678,6 +1694,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
 
+
+    def _persist_setup(self) -> bool:
+        cfg = self.routing_cfg
+        if (
+            self.routing_fn is not routing_std or self.routing_gate is None or self.router_pre_norm is not None or
+            self.routed_pre_norm is not None or self.routed_post_norm is not None or self.latent_in is not None or
+            self.latent_out is not None or self.alt_residual_channel or not self.bc_sh_exp or not self.shared_gate or
+            self.cpu_split_first is not None or self.cpu_offload or self.tp_reduce or self.routing_device is not None or
+            getattr(cfg, "per_expert_scale", None) is not None or self.intermediate_size == 0 or
+            self.num_local_experts != self.num_experts
+        ):
+            return False
+        from .block_sparse_mlp_routing import _gate_t
+        gate_t = _gate_t(cfg)
+        return bool(self.bc.persist_prepare(gate_t, self.num_experts_per_tok))
 
     def _capture_all_experts(self, y, selected_experts, sens_weights, aff_w, params):
         """

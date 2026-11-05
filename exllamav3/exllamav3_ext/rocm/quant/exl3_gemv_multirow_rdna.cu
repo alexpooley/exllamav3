@@ -1268,3 +1268,557 @@ void exl3_rocm_moe_decode
         S, top_k, (int) K_d, (int) cb_d, true, device, stream);
     cuda_check(cudaPeekAtLastError());
 }
+
+
+// =============================================================================
+// Persistent MoE block at bsz 1: exl3_rocm_moe_persist
+// =============================================================================
+//
+// One launch for the whole MoE block of one token: router GEMV, top-k softmax, the routed experts' gate|up,
+// activation and down, the shared expert and its sigmoid gate, and the sum. A co-resident grid (sized from the
+// occupancy, at most the largest phase's task count) runs three phases separated by two grid barriers
+// (counter + generation word, no float atomics):
+//
+//   phase 0  router scores (one warp per expert row), shared expert gate|up (it does not depend on the routing),
+//            shared gate dot sigmoid(x . w)
+//   phase 1  top-k + softmax, computed by every block on the stored scores (identical, no further barrier);
+//            routed gate|up, one task per (slot, matrix, 128-column segment)
+//   phase 2  activation + down input rotation into LDS and the weighted down GEMV, one task per (slot,
+//            128-column output segment); the shared expert is slot S with weight sigmoid(x . w). The fused
+//            epilogue's grouped reduce (fixed slot order) writes the block output into row 0 of out.
+//
+// A task rotates its own input into LDS (the input is 2.5-5 KB), so no phase needs a rotated global copy. The
+// dot body, its split-K and the output-rotation epilogue are exl3_gemv_mr_body's. Fixed reduction orders
+// throughout, so the result is deterministic run to run; it is not bit-identical to the multi-launch route (the
+// split-K wave count, the score precision and the shared expert's weighting differ).
+
+struct MoePersistArgs
+{
+    const half* y;               // (Hi)
+    const half* gate_t;          // (E, Hi) router
+    const half* sh_w;            // (Hi) shared gate weight
+    const uintptr_t* rgu_t; const uintptr_t* rgu_s; const uintptr_t* rgu_v;   // (2E) gate then up
+    const uintptr_t* rd_t; const uintptr_t* rd_s; const uintptr_t* rd_v;      // (E)
+    const uintptr_t* sgu_t; const uintptr_t* sgu_s; const uintptr_t* sgu_v;   // (2) shared gate, up
+    const uintptr_t* sd_t; const uintptr_t* sd_s; const uintptr_t* sd_v;      // (1) shared down
+    float* scores;               // (E + 1): scores, then sigmoid(x . w)
+    int64_t* sel_out;            // (K) chosen experts (diagnostics)
+    half* gu;                    // (2 (S + 1), I): gate rows of slots 0..S, then up rows
+    float* out;                  // (S + 1, Ho): rotated weighted partials; row 0 = result
+    unsigned* bar;               // [0] arrivals, [1] generation
+    int* segc;                   // segment arrival counters
+    int* redc;                   // reduction counters (Ho / 128)
+    int Hi, I, Ho, E, K;
+    int core;
+    int red_bytes;
+    float act_limit_r, act_limit_s;
+    int phases;
+};
+
+// exl3_gemv_mr_body at M = 1 with the rotated input in LDS: the tiles core takes A_LDS = true here (the body's
+// own instantiation reads A through global-memory loads, which an LDS address faults)
+template <int bits, bool c_fp32, int cb, int W>
+__device__ __forceinline__ void moe_persist_body
+(
+    const half* A_lds, const uint16_t* __restrict__ B, const int size_k, const int n_tiles, const int tile_n,
+    void* Cb, const int64_t row_off, const half* __restrict__ svh, int* seg_counters,
+    const int warp_id, const int lane, const int core,
+    const float w_scale, int* red_counters, const int red_target, const int size_n
+)
+{
+    extern __shared__ char shared_mem[];
+    float* sh_red = (float*) shared_mem;
+    constexpr int T = EXL3_GEMV_TILES_TMAX;
+    float acc[T];
+    exl3_gemv_dot_tile_splitk_t<bits, cb, W, 1, true, T>
+    (
+        core, 1, A_lds, size_k, B, size_k, n_tiles, tile_n, warp_id, lane, sh_red, acc,
+        [&](int tn, int k0, int k1, float* o)
+        {
+            exl3_gemv_dot_tile_direct_mr<bits, cb, 1>(A_lds, size_k, B, n_tiles, tn, lane, k0, k1, o, 1);
+        },
+        1
+    );
+    if (warp_id != 0) return;
+    if (red_counters)
+        exl3_gemv_fused_epilogue<c_fp32>(acc[0], Cb, row_off, size_n, tile_n, lane, svh, w_scale,
+            seg_counters + tile_n / 8, red_counters + tile_n / 8, red_target, 1);
+    else
+        exl3_gemv_fused_epilogue_mr<c_fp32, 1>(acc, Cb, row_off, size_n, 1, tile_n, lane, svh, seg_counters + tile_n / 8);
+}
+
+// One warp, one 16-column tile over the whole K (A in LDS), then the fused output epilogue: the warps of a block
+// take the 8 tiles of one 128-column segment together, so a segment is one pass with no block barrier
+template <int bits, bool c_fp32, int cb>
+__device__ __forceinline__ void moe_persist_tile
+(
+    const half* A_lds, const uint16_t* __restrict__ B, const int size_k, const int n_tiles, const int tile_n,
+    void* Cb, const int64_t row_off, const half* __restrict__ svh, int* seg_counters,
+    const int lane, const int core,
+    const float w_scale, int* red_counters, const int red_target, const int size_n
+)
+{
+    float acc[1];
+    if (core == EXL3_GEMV_CORE_TILES)
+        exl3_gemv_dot_tile_tiles<bits, cb, 1, true, exl3_tiles_u_single<bits>(), 1>
+            (A_lds, size_k, B, n_tiles, tile_n, lane, 0, size_k / 16, acc, 1);
+    else
+        exl3_gemv_dot_tile_direct_mr<bits, cb, 1>(A_lds, size_k, B, n_tiles, tile_n, lane, 0, size_k / 16, acc, 1);
+    if (red_counters)
+        exl3_gemv_fused_epilogue<c_fp32>(acc[0], Cb, row_off, size_n, tile_n, lane, svh, w_scale,
+            seg_counters + tile_n / 8, red_counters + tile_n / 8, red_target, 1);
+    else
+        exl3_gemv_fused_epilogue_mr<c_fp32, 1>(acc, Cb, row_off, size_n, 1, tile_n, lane, svh, seg_counters + tile_n / 8);
+}
+
+// One 128-column output segment (8 adjacent N-tiles) per block: every warp reads all 8 tiles (T = 8, 8 * 32 * bits
+// contiguous bytes per k-tile) over its own K chunk, the chunks are summed in warp order through LDS, and warp t
+// stores tile t through the fused output epilogue. Every thread enters. U: k-tiles in flight per load batch
+#ifndef EXL3_MOE_PERSIST_U
+#define EXL3_MOE_PERSIST_U 2
+#endif
+template <int bits, bool c_fp32, int cb, int W>
+__device__ __forceinline__ void moe_persist_seg
+(
+    const half* A_lds, const uint16_t* __restrict__ B, const int size_k, const int n_tiles, const int seg,
+    void* Cb, const int64_t row_off, const half* __restrict__ svh, int* seg_counters,
+    const int warp, const int lane,
+    const float w_scale, int* red_counters, const int red_target, const int size_n
+)
+{
+    extern __shared__ char shared_mem[];
+    float* sh_red = (float*) shared_mem;    // [W][8][16]
+    const int num_k_tiles = size_k / 16;
+    const int chunk = (num_k_tiles + W - 1) / W;
+    const int kb0 = exl3_uni(warp) * chunk;
+    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
+    float acc[8];
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) acc[t] = 0.0f;
+    if (kb0 < kb1)
+        exl3_gemv_dot_tile_tiles<bits, cb, 1, true, EXL3_MOE_PERSIST_U, 8>
+            (A_lds, size_k, B, n_tiles, seg * 8, lane, kb0, kb1, acc, 1);
+    if (lane < 16)
+    {
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) sh_red[(warp * 8 + t) * 16 + lane] = acc[t];
+    }
+    __syncthreads();
+    if (warp < 8)
+    {
+        float total = 0.0f;
+        if (lane < 16)
+        {
+            #pragma unroll
+            for (int w = 0; w < W; ++w) total += sh_red[(w * 8 + warp) * 16 + lane];
+        }
+        const int tile_n = seg * 8 + warp;
+        if (red_counters)
+            exl3_gemv_fused_epilogue<c_fp32>(total, Cb, row_off, size_n, tile_n, lane, svh, w_scale,
+                seg_counters + seg, red_counters + seg, red_target, 1);
+        else
+            exl3_gemv_fused_epilogue_mr<c_fp32, 1>(&total, Cb, row_off, size_n, 1, tile_n, lane, svh, seg_counters + seg);
+    }
+}
+
+__device__ __forceinline__ void moe_persist_barrier(unsigned* bar)
+{
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        const unsigned gen = __hip_atomic_load(bar + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        const unsigned arrived = __hip_atomic_fetch_add(bar, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (arrived == gridDim.x - 1)
+        {
+            __hip_atomic_store(bar, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_fetch_add(bar + 1, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        else
+        {
+            // Bounded wait: a barrier that never completes (a launch the device cannot hold co-resident) records
+            // itself in bar[2..3] and falls through instead of hanging the device
+            unsigned spins = 0;
+            while (__hip_atomic_load(bar + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == gen)
+            {
+                __builtin_amdgcn_s_sleep(1);
+                if (++spins == (1u << 22))
+                {
+                    __hip_atomic_store(bar + 2, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    __hip_atomic_store(bar + 3, __hip_atomic_load(bar, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    break;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    __threadfence();
+}
+
+// Rotate x (LDS, Hi halves) with suh into dst (LDS); every thread enters
+template <int W>
+__device__ __forceinline__ void moe_persist_rotate(const half* x_s, half* dst, const half* suh, int Hi, int warp, int lane)
+{
+    for (int seg = warp; seg < Hi / 128; seg += W)
+        exl3_gemv_had_in_128(x_s + seg * 128, dst + seg * 128, suh + seg * 128, lane);
+    __syncthreads();
+}
+
+template <int BR, int BS, int CB, int W>
+static __global__
+__launch_bounds__(W * 32)
+__attribute__((amdgpu_flat_work_group_size(W * 32, W * 32)))
+void exl3_moe_persist_kernel(const MoePersistArgs a)
+{
+    static_assert(W == 8, "one warp per tile of a 128-column segment");
+    extern __shared__ char shared_mem[];
+    half* x_s = (half*) (shared_mem + a.red_bytes);
+    half* a_s = x_s + a.Hi;
+    __shared__ int sel_s[32];
+    __shared__ float w_s[32];
+    __shared__ float red_s[W];
+    __shared__ float sig_s;
+
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    const int warp = t / 32;
+    const int Hi = a.Hi, I = a.I, Ho = a.Ho, E = a.E, K = a.K;
+    const int S = K;                 // routed slots (bsz 1)
+    const int R = S + 1;             // gu rows per matrix, out rows
+    const int segs_i = I / 128;
+    const int segs_o = Ho / 128;
+
+    for (int i = t; i < Hi / 8; i += W * 32) ((uint4*) x_s)[i] = ((const uint4*) a.y)[i];
+    __syncthreads();
+    // Work list: tickets in [0, n0) are phase 0 tasks, [n0, n0 + n1) phase 1, then phase 2. A block takes the next
+    // ticket from a global counter, and a phase 1 (2) task waits until every phase 0 (1) task has completed. Every
+    // ticket below a waiting block's own was taken by a block that is already running, so the waits always resolve
+    // whatever part of the grid is resident (no co-residency assumption, unlike a grid barrier). The last block
+    // to exit resets the counters for the next launch.
+    unsigned* tk_ctr = a.bar + 4;
+    unsigned* done0 = a.bar + 5;
+    unsigned* done1 = a.bar + 6;
+    unsigned* exitc = a.bar + 7;
+    const int n_rt = (E + W - 1) / W;
+    const int n_sgu = 2 * segs_i;
+    const int n0 = n_rt + n_sgu + 1;
+    const int n1 = 2 * S * segs_i;
+    const int n2 = R * segs_o;
+    const int n_total = a.phases >= 3 ? n0 + n1 + n2 : (a.phases == 2 ? n0 + n1 : n0);
+    __shared__ int tk_s;
+    bool have_topk = false, have_p1 = false;
+
+    auto wait_count = [&](unsigned* c, unsigned target)
+    {
+        if (t == 0)
+        {
+            unsigned spins = 0;
+            while (__hip_atomic_load(c, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target)
+            {
+                __builtin_amdgcn_s_sleep(1);
+                if (++spins == (1u << 24)) { __hip_atomic_store(a.bar + 2, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); break; }
+            }
+        }
+        __syncthreads();
+        __threadfence();
+    };
+
+    for (;;)
+    {
+        if (t == 0) tk_s = (int) __hip_atomic_fetch_add(tk_ctr, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __syncthreads();
+        const int tk = tk_s;
+        __syncthreads();
+        if (tk >= n_total) break;
+
+        unsigned* done = nullptr;
+        if (tk < n0)
+        {
+            const int task = tk;
+            if (task < n_rt)
+            {
+                const int row = task * W + warp;
+                if (row < E)
+                {
+                    const uint4* w4 = (const uint4*) (a.gate_t + (size_t) row * Hi);
+                    float sum = 0.0f;
+                    for (int i = lane; i < Hi / 8; i += 32)
+                    {
+                        uint4 wv = w4[i];
+                        uint4 xv = ((const uint4*) x_s)[i];
+                        const half2* wh = (const half2*) &wv;
+                        const half2* xh = (const half2*) &xv;
+                        #pragma unroll
+                        for (int q = 0; q < 4; ++q)
+                        {
+                            float2 wf = __half22float2(wh[q]);
+                            float2 xf = __half22float2(xh[q]);
+                            sum = fmaf(xf.x, wf.x, sum);
+                            sum = fmaf(xf.y, wf.y, sum);
+                        }
+                    }
+                    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor(sum, o, 32);
+                    if (lane == 0) a.scores[row] = __half2float(__float2half_rn(sum));
+                }
+            }
+            else if (task < n_rt + n_sgu)
+            {
+                const int q = task - n_rt;
+                const int m = q / segs_i;
+                const int seg = q % segs_i;
+                moe_persist_rotate<W>(x_s, a_s, (const half*) a.sgu_s[m], Hi, warp, lane);
+                const int row = m * R + S;
+                moe_persist_seg<BS, false, CB, W>
+                (
+                    a_s, (const uint16_t*) a.sgu_t[m], Hi, I / 16, seg,
+                    a.gu, (int64_t) row * I, (const half*) a.sgu_v[m],
+                    a.segc + row * segs_i, warp, lane, 0.0f, nullptr, 0, I
+                );
+                __syncthreads();
+            }
+            else
+            {
+                float v = 0.0f;
+                for (int i = t; i < Hi; i += W * 32)
+                    v = fmaf(__half2float(a.sh_w[i]), __half2float(x_s[i]), v);
+                for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o, 32);
+                if (lane == 0) red_s[warp] = v;
+                __syncthreads();
+                if (t == 0)
+                {
+                    float s = 0.0f;
+                    for (int w = 0; w < W; ++w) s += red_s[w];
+                    a.scores[E] = 1.0f / (1.0f + __expf(-s));
+                }
+                __syncthreads();
+            }
+            done = done0;
+        }
+        else
+        {
+            if (!have_topk)
+            {
+                wait_count(done0, (unsigned) n0);
+            if (warp == 0)
+            {
+                constexpr int MAXC = 512 / 32;
+                float v[MAXC];
+                #pragma unroll
+                for (int i = 0; i < MAXC; ++i)
+                {
+                    const int e = lane + 32 * i;
+                    float sv = e < E ? __hip_atomic_load(a.scores + e, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : (-__builtin_inff());
+                    v[i] = sv == sv ? sv : (-__builtin_inff());     // NaN scores (warmup garbage) rank lowest
+                }
+                float top0 = 0.0f, esum = 0.0f;
+                uint32_t taken = 0;
+                float ev[32];
+                for (int k = 0; k < K; ++k)
+                {
+                    // Highest score, lowest index on ties; taken marks this lane's picks, so every pick is a distinct
+                    // in-range expert even when scores tie at -inf
+                    float bv = (-__builtin_inff()); int bi = 0x7fffffff;
+                    #pragma unroll
+                    for (int i = 0; i < MAXC; ++i)
+                    {
+                        const int e = lane + 32 * i;
+                        if (e < E && !((taken >> i) & 1u) && (v[i] > bv || bi == 0x7fffffff)) { bv = v[i]; bi = e; }
+                    }
+                    for (int o = 16; o > 0; o >>= 1)
+                    {
+                        float ov = __shfl_xor(bv, o, 32);
+                        int oi = __shfl_xor(bi, o, 32);
+                        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+                    }
+                    if (lane == (bi & 31)) taken |= 1u << (bi >> 5);
+                    if (k == 0) top0 = bv;
+                    ev[k] = __expf(bv - top0);
+                    esum += ev[k];
+                    if (lane == 0) sel_s[k] = bi;
+                }
+                if (lane == 0)
+                {
+                    const float inv = 1.0f / (esum + 1e-20f);
+                    for (int k = 0; k < K; ++k) w_s[k] = __half2float(__float2half_rn(ev[k] * inv));
+                    sig_s = __hip_atomic_load(a.scores + E, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    if (blockIdx.x == 0) for (int k = 0; k < K; ++k) a.sel_out[k] = sel_s[k];
+                }
+            }
+                __syncthreads();
+                have_topk = true;
+            }
+            if (tk < n0 + n1)
+            {
+                const int task = tk - n0;
+                const int m = task / (S * segs_i);
+                const int rem = task % (S * segs_i);
+                const int j = rem / segs_i;
+                const int seg = rem % segs_i;
+                const int mat = sel_s[j] + m * E;
+                moe_persist_rotate<W>(x_s, a_s, (const half*) a.rgu_s[mat], Hi, warp, lane);
+                const int row = m * R + j;
+                moe_persist_seg<BR, false, CB, W>
+                (
+                    a_s, (const uint16_t*) a.rgu_t[mat], Hi, I / 16, seg,
+                    a.gu, (int64_t) row * I, (const half*) a.rgu_v[mat],
+                    a.segc + row * segs_i, warp, lane, 0.0f, nullptr, 0, I
+                );
+                __syncthreads();
+                done = done1;
+            }
+            else
+            {
+                if (!have_p1) { wait_count(done1, (unsigned) n1); have_p1 = true; }
+                const int task = tk - n0 - n1;
+                const int j = task / segs_o;
+                const int oseg = task % segs_o;
+                const bool sh = j == S;
+                const half* suh_d = sh ? (const half*) a.sd_s[0] : (const half*) a.rd_s[sel_s[j]];
+                const float act_limit = sh ? a.act_limit_s : a.act_limit_r;
+                for (int seg = warp; seg < segs_i; seg += W)
+                {
+                    const int64_t off = (int64_t) j * I + seg * 128;
+                    half4 g = ((const half4*) (a.gu + off))[lane];
+                    half4 u = ((const half4*) (a.gu + (int64_t) R * I + off))[lane];
+                    half2 xg[2] = { g.x, g.y };
+                    half2 yu[2] = { u.x, u.y };
+                    #pragma unroll
+                    for (int i = 0; i < 2; ++i)
+                    {
+                        half2 x2 = exl3_moe_silu_h2(xg[i]);
+                        half2 y2 = yu[i];
+                        if (act_limit != 0.0f)
+                        {
+                            y2 = __hmax2(y2, __float2half2_rn(-act_limit));
+                            y2 = __hmin2(y2, __float2half2_rn(act_limit));
+                            x2 = __hmin2(x2, __float2half2_rn(act_limit));
+                        }
+                        xg[i] = __hmul2(x2, y2);
+                    }
+                    half4 av;
+                    av.x = xg[0];
+                    av.y = xg[1];
+                    exl3_moe_had_in_128_v(av, a_s + seg * 128, suh_d + seg * 128, lane);
+                }
+                __syncthreads();
+                const float w_scale = 0.088388347648f * (sh ? sig_s : w_s[j]);
+                if (sh)
+                    moe_persist_seg<BS, true, CB, W>
+                    (
+                        a_s, (const uint16_t*) a.sd_t[0], I, Ho / 16, oseg,
+                        a.out, (int64_t) j * Ho, (const half*) a.sd_v[0],
+                        a.segc + j * segs_o, warp, lane, w_scale, a.redc, R, Ho
+                    );
+                else
+                    moe_persist_seg<BR, true, CB, W>
+                    (
+                        a_s, (const uint16_t*) a.rd_t[sel_s[j]], I, Ho / 16, oseg,
+                        a.out, (int64_t) j * Ho, (const half*) a.rd_v[sel_s[j]],
+                        a.segc + j * segs_o, warp, lane, w_scale, a.redc, R, Ho
+                    );
+                __syncthreads();
+            }
+        }
+        // Completion: every wave's stores are visible before the count
+        __threadfence();
+        __syncthreads();
+        if (t == 0 && done) __hip_atomic_fetch_add(done, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+
+    if (t == 0)
+    {
+        if (__hip_atomic_fetch_add(exitc, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) == gridDim.x - 1)
+        {
+            __hip_atomic_store(tk_ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(done0, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(done1, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(exitc, 0u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        }
+    }
+}
+
+#define MOE_PERSIST_W 8
+
+bool exl3_rocm_moe_persist_fits(int E, int K, int Hi, int I, int Ho, int K_r, int K_s, int cb)
+{
+    const bool kr = K_r == 2 || K_r == EXL3_HALF_BITS(2) || K_r == 3 || K_r == 4;
+    return kr && K_s == 6 && cb == 2 && E <= 512 && K <= 16 && Hi % 128 == 0 && I % 128 == 0 && Ho % 128 == 0
+        && Hi <= 8192 && I <= Hi && (2 * (K + 1)) * (I / 128) <= 2048 && (K + 1) * (Ho / 128) <= 2048 && Ho / 128 <= 1024;
+}
+
+void exl3_rocm_moe_persist
+(
+    const at::Tensor& y, const at::Tensor& gate_t, const at::Tensor& sh_w,
+    const at::Tensor& rgu_t, const at::Tensor& rgu_s, const at::Tensor& rgu_v,
+    const at::Tensor& rd_t, const at::Tensor& rd_s, const at::Tensor& rd_v,
+    const at::Tensor& sgu_t, const at::Tensor& sgu_s, const at::Tensor& sgu_v,
+    const at::Tensor& sd_t, const at::Tensor& sd_s, const at::Tensor& sd_v,
+    at::Tensor& scores, at::Tensor& sel_out, at::Tensor& gu, at::Tensor& out, at::Tensor& ctr,
+    int64_t K, int64_t K_r, int64_t K_s, int64_t cb, double act_limit_r, double act_limit_s
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(y.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    MoePersistArgs a;
+    a.Hi = (int) y.size(-1);
+    a.E = (int) gate_t.size(0);
+    a.I = (int) gu.size(-1);
+    a.Ho = (int) out.size(-1);
+    a.K = (int) K;
+    TORCH_CHECK(y.numel() == a.Hi && gate_t.size(1) == a.Hi, "moe_persist: bsz 1 only");
+    TORCH_CHECK(exl3_rocm_moe_persist_fits(a.E, a.K, a.Hi, a.I, a.Ho, (int) K_r, (int) K_s, (int) cb), "moe_persist: shape");
+    TORCH_CHECK(gu.numel() >= (int64_t) 2 * (K + 1) * a.I && out.numel() >= (int64_t) (K + 1) * a.Ho
+                && scores.numel() >= a.E + 1 && ctr.numel() >= 64 + 2048 + 1024, "moe_persist: scratch");
+    a.y = (const half*) y.data_ptr();
+    a.gate_t = (const half*) gate_t.data_ptr();
+    a.sh_w = (const half*) sh_w.data_ptr();
+    a.rgu_t = (const uintptr_t*) rgu_t.data_ptr(); a.rgu_s = (const uintptr_t*) rgu_s.data_ptr(); a.rgu_v = (const uintptr_t*) rgu_v.data_ptr();
+    a.rd_t = (const uintptr_t*) rd_t.data_ptr(); a.rd_s = (const uintptr_t*) rd_s.data_ptr(); a.rd_v = (const uintptr_t*) rd_v.data_ptr();
+    a.sgu_t = (const uintptr_t*) sgu_t.data_ptr(); a.sgu_s = (const uintptr_t*) sgu_s.data_ptr(); a.sgu_v = (const uintptr_t*) sgu_v.data_ptr();
+    a.sd_t = (const uintptr_t*) sd_t.data_ptr(); a.sd_s = (const uintptr_t*) sd_s.data_ptr(); a.sd_v = (const uintptr_t*) sd_v.data_ptr();
+    a.scores = (float*) scores.data_ptr();
+    a.sel_out = (int64_t*) sel_out.data_ptr();
+    a.gu = (half*) gu.data_ptr();
+    a.out = (float*) out.data_ptr();
+    int* c = (int*) ctr.data_ptr();
+    a.bar = (unsigned*) c;
+    a.segc = c + 64;
+    a.redc = c + 64 + 2048;
+    a.core = exl3_gemv_core_mode();
+    a.red_bytes = MOE_PERSIST_W * 8 * 16 * (int) sizeof(float);
+    a.act_limit_r = (float) act_limit_r;
+    a.act_limit_s = (float) act_limit_s;
+    { const char* e = std::getenv("EXL3_MOE_PERSIST_PHASES"); a.phases = e ? atoi(e) : 3; }
+    const size_t smem = a.red_bytes + (size_t) 2 * a.Hi * sizeof(half);
+
+    const int device = y.get_device();
+    const int max_tasks = std::max((a.E + MOE_PERSIST_W - 1) / MOE_PERSIST_W + 2 * (a.I / 128) + 1,
+                          std::max(2 * a.K * (a.I / 128), (a.K + 1) * (a.Ho / 128)));
+
+    #define MOE_PERSIST_LAUNCH(BR) \
+    { \
+        auto kern = exl3_moe_persist_kernel<BR, 6, 2, MOE_PERSIST_W>; \
+        static int occ_cache[64] = {}; \
+        int& occ = occ_cache[device]; \
+        if (!occ) \
+        { \
+            int n = 0; \
+            cuda_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, kern, MOE_PERSIST_W * 32, smem)); \
+            int cus = 0; cuda_check(hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, device)); \
+            occ = std::max(1, n) * cus; \
+        } \
+        const char* g_env = std::getenv("EXL3_MOE_PERSIST_GRID"); \
+        int grid = std::min(occ, max_tasks); \
+        if (g_env) grid = std::min(grid, std::max(1, atoi(g_env))); \
+        hipLaunchKernelGGL(kern, dim3(grid), dim3(MOE_PERSIST_W * 32), smem, stream, a); \
+    }
+    switch ((int) K_r)
+    {
+        case 2: MOE_PERSIST_LAUNCH(2) break;
+        case 3: MOE_PERSIST_LAUNCH(3) break;
+        case 4: MOE_PERSIST_LAUNCH(4) break;
+        case EXL3_HALF_BITS(2): MOE_PERSIST_LAUNCH(EXL3_HALF_BITS(2)) break;
+    }
+    #undef MOE_PERSIST_LAUNCH
+    cuda_check(cudaPeekAtLastError());
+}

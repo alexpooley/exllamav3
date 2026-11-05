@@ -108,3 +108,15 @@ void exl3_rocm_moe_decode
     int64_t cb_d,
     double act_limit
 );
+// Persistent bsz 1 MoE block (router, top-k, routed + shared experts, sigmoid gate, sum) in one launch
+bool exl3_rocm_moe_persist_fits(int E, int K, int Hi, int I, int Ho, int K_r, int K_s, int cb);
+void exl3_rocm_moe_persist
+(
+    const at::Tensor& y, const at::Tensor& gate_t, const at::Tensor& sh_w,
+    const at::Tensor& rgu_t, const at::Tensor& rgu_s, const at::Tensor& rgu_v,
+    const at::Tensor& rd_t, const at::Tensor& rd_s, const at::Tensor& rd_v,
+    const at::Tensor& sgu_t, const at::Tensor& sgu_s, const at::Tensor& sgu_v,
+    const at::Tensor& sd_t, const at::Tensor& sd_s, const at::Tensor& sd_v,
+    at::Tensor& scores, at::Tensor& sel_out, at::Tensor& gu, at::Tensor& out, at::Tensor& ctr,
+    int64_t K, int64_t K_r, int64_t K_s, int64_t cb, double act_limit_r, double act_limit_s
+);

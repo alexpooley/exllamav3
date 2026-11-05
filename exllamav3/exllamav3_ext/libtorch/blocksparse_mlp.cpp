@@ -638,3 +638,67 @@ void BC_BlockSparseMLP::run_single_expert_dq
     hgemm_recon(interm_a, dq_temp_down, out);
     had_r_128(out, out, c10::nullopt, downs[expert_idx]->svh, 1.0);
 }
+
+#if defined(USE_ROCM)
+// Persistent route: available for gated SiLU experts on the RDNA decode op with a fused [gate, up] shared expert
+// and an fp16 shared gate, at widths exl3_rocm_moe_persist instantiates. gate_t: the (E, Hi) half router
+bool BC_BlockSparseMLP::persist_prepare(const at::Tensor& gate_t, int64_t top_k)
+{
+    persist = false;
+    auto& se = shared_experts;
+    if (!rdna_moe || !se || !shared_gate || !out_d_sh || !se->gu_ptrs_trellis || !se->down) return false;
+    if (!se->act_silu || se->act_gelu || se->act_relu2 || se->down->bias) return false;
+    if (rdna_K_gu != rdna_K_d) return false;
+    auto& d = se->down;
+    const float Ks = d->K;
+    if (se->gu_K != Ks || (float) (int) Ks != Ks || se->gu_mul1 != d->mul1 || !d->mul1 || rdna_cb != 2) return false;
+    const int Hi = (int) yh2.size(-1);
+    const int I = (int) interm_a2.size(-1);
+    const int Ho = (int) out_d2.size(-1);
+    const int H = (int) out_bszn.size(-1);
+    if (Ho != H || (int) se->gu.size(-1) != I || (int) d->trellis.size(1) * 16 != Ho || (int) se->guh.size(-1) != Hi) return false;
+    if (gate_t.dim() != 2 || gate_t.size(1) != Hi || gate_t.scalar_type() != at::kHalf || !gate_t.is_contiguous()) return false;
+    if (shared_gate->weight.numel() != Hi || shared_gate->weight.scalar_type() != at::kHalf) return false;
+    const int E = (int) gate_t.size(0);
+    if (E != (int) down_ptrs_trellis.size(0)) return false;
+    if (!exl3_rocm_moe_persist_fits(E, (int) top_k, Hi, I, Ho, rdna_K_gu, (int) Ks, rdna_cb)) return false;
+    if (se->gu_ptrs_trellis->size(0) != 2) return false;
+
+    auto dev = yh2.device();
+    auto table = [&](const at::Tensor& t) { return at::tensor({(int64_t) t.data_ptr()}, at::TensorOptions().dtype(at::kLong)).to(dev); };
+    p_gate_t = gate_t;
+    p_sh_w = shared_gate->weight.contiguous().view({-1});
+    p_sgu_t = se->gu_ptrs_trellis->contiguous();
+    p_sgu_s = se->gu_ptrs_suh->contiguous();
+    p_sgu_v = se->gu_ptrs_svh->contiguous();
+    p_sd_t = table(d->trellis); p_sd_s = table(d->suh); p_sd_v = table(d->svh);
+    p_scores = at::empty({E + 1}, at::TensorOptions().dtype(at::kFloat).device(dev));
+    p_sel = at::empty({top_k}, at::TensorOptions().dtype(at::kLong).device(dev));
+    p_gu = at::empty({2 * (top_k + 1), I}, at::TensorOptions().dtype(at::kHalf).device(dev));
+    p_out = at::empty({top_k + 1, Ho}, at::TensorOptions().dtype(at::kFloat).device(dev));
+    p_ctr = at::zeros({64 + 2048 + 1024}, at::TensorOptions().dtype(at::kInt).device(dev));
+    p_K = (int) top_k;
+    p_K_s = (int) Ks;
+    persist = true;
+    return true;
+}
+
+at::Tensor BC_BlockSparseMLP::run_persist(const at::Tensor& y)
+{
+    TORCH_CHECK(persist, "run_persist: not prepared");
+    c10::cuda::CUDAGuard device_guard(y.device());
+    exl3_rocm_moe_persist
+    (
+        y, p_gate_t, p_sh_w,
+        rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh,
+        down_ptrs_trellis, down_ptrs_suh, down_ptrs_svh,
+        p_sgu_t, p_sgu_s, p_sgu_v, p_sd_t, p_sd_s, p_sd_v,
+        p_scores, p_sel, p_gu, p_out, p_ctr,
+        p_K, rdna_K_gu, p_K_s, rdna_cb, act_limit, shared_experts->act_limit
+    );
+    return p_out.slice(0, 0, 1);
+}
+#else
+bool BC_BlockSparseMLP::persist_prepare(const at::Tensor& gate_t, int64_t top_k) { return false; }
+at::Tensor BC_BlockSparseMLP::run_persist(const at::Tensor& y) { TORCH_CHECK(false, "run_persist: ROCm only"); }
+#endif

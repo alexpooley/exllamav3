@@ -101,6 +101,11 @@ struct BC_BlockSparseMLP
     bool rdna_moe = false;
     at::Tensor rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh;     // (2E) gate tables then up tables
     int rdna_K_gu = 0, rdna_K_d = 0, rdna_cb = 0;
+    // Persistent one-launch bsz 1 block (exl3_rocm_moe_persist), set up by persist_prepare
+    bool persist = false;
+    at::Tensor p_gate_t, p_sh_w, p_sgu_t, p_sgu_s, p_sgu_v, p_sd_t, p_sd_s, p_sd_v;
+    at::Tensor p_scores, p_sel, p_gu, p_out, p_ctr;
+    int p_K = 0, p_K_s = 0;
     bool run_bszN_rdna(const at::Tensor& y, const at::Tensor& selected_experts, const at::Tensor& routing_weights,
                        at::Tensor& result);
 #endif
@@ -179,6 +184,9 @@ struct BC_BlockSparseMLP
         at::Tensor& selected_experts,
         at::Tensor& routing_weights
     );
+
+    bool persist_prepare(const at::Tensor& gate_t, int64_t top_k);
+    at::Tensor run_persist(const at::Tensor& y);
 
     void run_single_expert_gr
     (
