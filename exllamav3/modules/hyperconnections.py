@@ -38,6 +38,7 @@ def hc_flush(params: dict):
 # on the fly and writes the updated streams back), saving the hc_apply launch. The pending entry is the mHC
 # "hc_pending" one with comb None, so every hc_flush point (device moves, PLE, HyperHead) lands it as well
 _gr_fold = os.environ.get("EXL3_GR_FOLD", "1" if torch.version.hip else "0") != "0"
+_gr_fold_tp = os.environ.get("EXL3_GR_FOLD_TP", "1") != "0"
 
 # Grid-barrier words for the one-launch GatedResidual decode site (gr_mix on ROCm), one zeroed pair per device;
 # the kernel leaves them as it found them, so graph replays and every site share them
@@ -706,7 +707,9 @@ class GatedResidual(Module):
         nxt = self.next_site
         if _gr_fold and R <= self.FUSED_MAX_R and nxt is not None and nxt.w_h is not None \
                 and nxt.w_h.device == x.device and x.dtype == torch.float and x.is_contiguous() \
-                and not params.get("export_state_layers") and "backend" not in params:
+                and not params.get("export_state_layers") and (_gr_fold_tp or "backend" not in params):
+            # (under TP the streams are replicated and rank-local; the all-reduce runs on the sublayer output
+            # before apply_, so nothing else reads them between two sites)
             params["hc_pending"] = (x, y2.contiguous(), post.reshape(R, self.hc_mult).contiguous(), None)
             return x
         # Decode-class rows: also emit the successor's weighted stream copy for its fused mix
