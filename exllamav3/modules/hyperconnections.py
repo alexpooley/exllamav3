@@ -44,6 +44,9 @@ _gr_fold_tp = os.environ.get("EXL3_GR_FOLD_TP", "1") != "0"
 # symmetric absmax, one fp16 scale per 128 proj columns (along H * D) and per 64 up ranks per output channel. Halves
 # the site's table bytes; off until a quality eval clears it. Other row counts keep the fp16 tables.
 _gr_i8 = os.environ.get("EXL3_GR_I8", "0") != "0"
+# The 5..16-row site kernel (fused path up to 16 rows on ROCm). Off by default until TP-ts run-to-run determinism
+# is settled (an open 1-ulp issue with the site kernel + the m <= 8 router GEMV); 1 enables it
+_gr_site16 = os.environ.get("EXL3_GR_SITE16", "0") != "0"
 
 
 def _quant_i8(t: torch.Tensor, g: int, dim: int):
@@ -496,6 +499,10 @@ class GatedResidual(Module):
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
+        # ROCm, the shape the one-launch site kernel serves: it covers up to 16 rows (batched / longer verify
+        # forwards), far cheaper there than the tiled path (which also rebuilds its int8 tables every call)
+        self.FUSED_MAX_R = 16 if (_gr_site16 and torch.version.hip and dev.type == "cuda" and H == 4 and Dh == 2560
+                                  and self.rank == 320 and hasattr(ext, "gr_mix_i8")) else GatedResidual.FUSED_MAX_R
         self.proj_q = self.proj_s = self.upx_q = self.upx_s = None
         if _gr_i8 and torch.version.hip and dev.type == "cuda" and H == 4 and Dh == 2560 and self.rank == 320 \
                 and hasattr(ext, "gr_mix_i8"):
