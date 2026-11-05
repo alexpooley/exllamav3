@@ -1173,10 +1173,12 @@ static void exl3_moe_dec_launch_dot
 
 // Whether exl3_rocm_moe_decode takes a call of S slots (bsz * top_k) at these widths: the same bounds the
 // op checks, for callers that fall back instead of raising
+// 2 * S slots: gate and up of every (row, expert) pick, MAX_BSZN = 16 rows of top_k <= 16
+#define MAX_BSZN_MOE_SLOTS 128
 bool exl3_rocm_moe_decode_fits(int S, int Hi, int I, int Ho, int K_gu, int cb_gu, int K_d, int cb_d)
 {
     return Hi % 128 == 0 && I % 128 == 0 && Ho % 128 == 0
-        && 2 * S <= 128 && 2 * S * (I / 128) <= EXL3_MGEMV_SEG_COUNTERS && Ho / 128 <= EXL3_MGEMV_RED_COUNTERS
+        && 2 * S <= 4 * MAX_BSZN_MOE_SLOTS && 2 * S * (I / 128) <= EXL3_MGEMV_SEG_COUNTERS && Ho / 128 <= EXL3_MGEMV_RED_COUNTERS
         && S * (Ho / 128) <= EXL3_MGEMV_SEG_COUNTERS
         && I / 16 <= EXL3_GEMV_SPLITK_MAX_TILES && Ho / 16 <= EXL3_GEMV_SPLITK_MAX_TILES
         && cb_gu >= 0 && cb_gu <= 2 && cb_d >= 0 && cb_d <= 2
@@ -1232,7 +1234,7 @@ void exl3_rocm_moe_decode
     TORCH_CHECK(Hi % 128 == 0 && I % 128 == 0 && Ho % 128 == 0, "moe_decode: dims must be multiples of 128");
     TORCH_CHECK(yh.numel() >= (int64_t) 2 * S * Hi && gu.numel() >= (int64_t) 2 * S * I
                 && a_had.numel() >= (int64_t) S * I && out.numel() >= (int64_t) S * Ho, "moe_decode: scratch too small");
-    TORCH_CHECK(2 * S <= 128 && 2 * S * (I / 128) <= EXL3_MGEMV_SEG_COUNTERS && Ho / 128 <= EXL3_MGEMV_RED_COUNTERS
+    TORCH_CHECK(2 * S <= 4 * MAX_BSZN_MOE_SLOTS && 2 * S * (I / 128) <= EXL3_MGEMV_SEG_COUNTERS && Ho / 128 <= EXL3_MGEMV_RED_COUNTERS
                 && S * (Ho / 128) <= EXL3_MGEMV_SEG_COUNTERS, "moe_decode: shape exceeds the arrival counters");
     TORCH_CHECK(I / 16 <= EXL3_GEMV_SPLITK_MAX_TILES && Ho / 16 <= EXL3_GEMV_SPLITK_MAX_TILES, "moe_decode: output too wide");
     TORCH_CHECK(cb_gu >= 0 && cb_gu <= 2 && cb_d >= 0 && cb_d <= 2

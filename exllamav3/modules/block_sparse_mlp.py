@@ -44,7 +44,7 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
-MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+MAX_BSZN = 16  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
 class FusedBuffers:
@@ -1072,7 +1072,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        # (the cooperative kernels hold at most 256 (row, expert) slots, exl3_moe_coop_kernel.cuh MAX_SLOTS)
+        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN and bsz * self.num_experts_per_tok <= 256
 
         # Persistent one-launch block (ROCm, bsz 1): router, top-k, routed and shared experts, sigmoid gate and
         # sum in one kernel (exl3_rocm_moe_persist). EXL3_ROCM_MOE_PERSIST=1 enables it
