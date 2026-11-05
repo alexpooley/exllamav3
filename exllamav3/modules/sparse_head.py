@@ -36,6 +36,7 @@ from ..ext import exllamav3_ext as ext
 # (the test suite points it at a scratch directory so runs neither read nor leave profiles)
 TOKEN_STATS_DIR = None
 
+_SDH_LOG = os.environ.get("EXL3_SDH_LOG", "0") != "0"   # log sparse-head maintenance timings
 _ALLOC_STEP = 1024          # column buffer growth granularity
 _SAVE_INTERVAL = 4096       # observed generated tokens between profile writes
 _MIN_SAVE_TOKENS = 64       # a session shorter than this leaves the saved profile alone
@@ -340,6 +341,12 @@ class SparseHead:
 
 
     def rebuild(self):
+        t0 = time.perf_counter(); n0 = self.swapped
+        self._rebuild()
+        if _SDH_LOG:
+            print(f" -- sparse head rebuild {1e3 * (time.perf_counter() - t0):.1f} ms, installed {self.swapped - n0}, active {self.n_active}", flush = True)
+
+    def _rebuild(self):
         """Move the subset toward the current top-capacity ids, with hysteresis against near-tie churn"""
         counts = self.counts
         cand_counts, cand = torch.topk(counts, self.capacity)
@@ -395,6 +402,12 @@ class SparseHead:
     # Cost model
 
     def benchmark(self, iters: int = 20, full_fn = None):
+        t0 = time.perf_counter()
+        self._benchmark(iters, full_fn)
+        if _SDH_LOG:
+            print(f" -- sparse head benchmark {1e3 * (time.perf_counter() - t0):.1f} ms, t_full {self.t_full}, t_sparse {self.t_sparse}", flush = True)
+
+    def _benchmark(self, iters: int = 20, full_fn = None):
         """Time one full-head and one sparse argmax at batch size 1 on the head's device; full_fn(x) replaces
         the full head's argmax (a tensor-parallel head, which has no local forward)"""
         lin = self.linear
@@ -558,6 +571,13 @@ class SparseHead:
     # Persistence
 
     def save_profile(self, path: str | None = None):
+        t0 = time.perf_counter()
+        r = self._save_profile(path)
+        if _SDH_LOG:
+            print(f" -- sparse head save_profile {1e3 * (time.perf_counter() - t0):.1f} ms", flush = True)
+        return r
+
+    def _save_profile(self, path: str | None = None):
         """Write the decayed counts; a session too short to have seen a meaningful sample leaves the file alone"""
         path = path or self.profile_path
         if not path or self.since_save < _MIN_SAVE_TOKENS:
