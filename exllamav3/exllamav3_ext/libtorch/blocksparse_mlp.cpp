@@ -154,8 +154,21 @@ bool BC_BlockSparseMLP::run_bszN_rdna
         dst.copy_(routed);
         if (shared_gate)
         {
-            at::Tensor g = at::sigmoid(at::matmul(y.to(at::kFloat), shared_gate->weight.reshape({-1, 1}).to(at::kFloat)));
-            dst.addcmul_(g, sh);
+            // One fused launch (as the CUDA path): dst += sh * sigmoid(y @ w). The ATen form below costs a
+            // cast of y and of w, an fp32 hipBLASLt GEMM with N = 1 (~140 us on gfx1100 for a 2560-long dot),
+            // a sigmoid and an addcmul per layer per token. Kept as the fallback for layouts the kernel rejects
+            at::Tensor w = shared_gate->weight.reshape({-1, 1});
+            if (sh.scalar_type() == at::kFloat && y.scalar_type() == at::kHalf && dst.scalar_type() == at::kFloat
+                && w.scalar_type() == at::kHalf && sh.is_contiguous() && y.is_contiguous() && dst.is_contiguous()
+                && w.is_contiguous() && sh.numel() == y.numel() && dst.numel() == y.numel() && w.size(0) == y.size(-1))
+            {
+                add_sigmoid_gate_proj_gr(sh, y, dst, w, nullptr);
+            }
+            else
+            {
+                at::Tensor g = at::sigmoid(at::matmul(y.to(at::kFloat), w.to(at::kFloat)));
+                dst.addcmul_(g, sh);
+            }
         }
         else
             dst.add_(sh);
