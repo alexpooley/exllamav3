@@ -101,7 +101,8 @@ struct BC_BlockSparseMLP
     bool rdna_moe = false;
     at::Tensor rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh;     // (2E) gate tables then up tables
     int rdna_K_gu = 0, rdna_K_d = 0, rdna_cb = 0;
-    bool run_bszN_rdna(const at::Tensor& y, const at::Tensor& selected_experts, const at::Tensor& routing_weights);
+    bool run_bszN_rdna(const at::Tensor& y, const at::Tensor& selected_experts, const at::Tensor& routing_weights,
+                       at::Tensor& result);
 #endif
 
     int max_experts_per_token;
@@ -171,7 +172,8 @@ struct BC_BlockSparseMLP
         bool _sh_coop = false
     );
 
-    void run_bszN
+    // Returns the (bsz, H) fp32 rows that hold the result: out_bszn, or the RDNA route's own output rows
+    at::Tensor run_bszN
     (
         const at::Tensor& y,
         at::Tensor& selected_experts,

@@ -1608,8 +1608,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # quantized paths apply), so this is the last tier
         else:
             assert bszn_eligible
-            self.bc.run_bszN(y, selected_experts, routing_weights)
-            final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
+            # The result rows: out_bszn, or the RDNA route's routed rows (merged in place, no copy)
+            final_hidden_states = self.bc.run_bszN(y, selected_experts, routing_weights).view(eshape)
             bc_sh_exp = self.bc_sh_exp
 
         # Independent shared-expert work can cover the CPU job (split tail or whole layer)
