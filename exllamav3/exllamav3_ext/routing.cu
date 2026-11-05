@@ -1482,6 +1482,14 @@ void routing_std
     TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_std: hidden and scores row counts differ");
     if (bsz == 0) return;
 
+#if defined(USE_ROCM)
+    // RDNA: bsz 1 router GEMV + top-k in one launch (rocm/routing_fused_rdna.cuh). Taken only where routing_gemv
+    // would run the w16 RDNA GEMV, so the scores are the same values
+    if ((!gate_i8.has_value() || hidden.numel() / hidden.size(-1) <= 3) &&
+        routing_std_fused_try(hidden, gate_t, gate_i8, scores, topk_indices, topk_weights, per_expert_scale, bias, stream))
+        return;
+#endif
+
     routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 
     int num_warps = CEIL_DIVIDE(num_experts, 32);
