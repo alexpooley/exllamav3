@@ -894,7 +894,11 @@ bool exl3_mgemv_multirow_try_launch
         // Multi-token calls (num_tokens groups of slots, the batched MoE route) size
         // the split-K from one token's slot count, so every slot keeps the reduction
         // order of a single-token call on the same experts (bit-identical rows)
-        const int bszm_rule = (num_tokens > 1 && bszm % num_tokens == 0) ? bszm / num_tokens : bszm;
+        // Per-matrix-width bundles (size_n_list, e.g. qkv + z) size it as the widest matrix run
+        // alone: those slots then keep the reduction order of a separate call, and the narrow
+        // matrices' slots are mostly empty blocks that should not push the rule to fewer waves
+        const int bszm_rule = size_n_list ? 1 :
+                              (num_tokens > 1 && bszm % num_tokens == 0) ? bszm / num_tokens : bszm;
         const int warps = exl3_gemv_mr_warps(size_k, n_tiles, bszm_rule);
         const int m_tile = exl3_gemv_mr_row_tile(size_m);
         const int core = exl3_gemv_core_mode();

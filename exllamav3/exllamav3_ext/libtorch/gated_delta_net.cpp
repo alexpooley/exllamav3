@@ -203,10 +203,16 @@ void BC_GatedDeltaNetSplit::set_qkvz_bundle
                 "BC_GatedDeltaNetSplit: qkvz pointer tables must cover every slice / both sources");
     auto dev = ptrs_trellis.device();
     qkvz_size_n = meta.select(0, 2).contiguous().to(dev);
-    qkvz_n_stride = meta.select(0, 3).contiguous().to(dev);
-    qkvz_had_src = meta.select(0, 4).contiguous().to(dev);
-    int width = meta[2][0].item<int>();
-    qkvz_carrier = at::empty({slices, MAX_BSZ * MAX_QLEN, width}, at::TensorOptions().dtype(at::kFloat).device(dev));
+    // Whole mode (SlicedMultiLinear whole = True): one zero-offset entry per source, run as the
+    // unsliced per-matrix-width bundle, so no stride / source tables
+    bool whole = slices == 2 && meta[1][0].item<int>() == 0 && meta[1][1].item<int>() == 0;
+    qkvz_n_stride = whole ? c10::nullopt : c10::optional<at::Tensor>(meta.select(0, 3).contiguous().to(dev));
+    qkvz_had_src = whole ? c10::nullopt : c10::optional<at::Tensor>(meta.select(0, 4).contiguous().to(dev));
+    int width = meta.select(0, 2).max().item<int>();
+    // The bundle writes every entry through qkvz_c_ptrs: the carrier only supplies the dtype and the
+    // (max) width, so a zero-stride expansion of one element
+    qkvz_carrier = at::empty({1, 1, 1}, at::TensorOptions().dtype(at::kFloat).device(dev))
+                   .expand({slices, MAX_BSZ * MAX_QLEN, width});
     qkvz_ptrs_trellis = std::move(ptrs_trellis);
     qkvz_ptrs_suh = std::move(ptrs_suh);
     qkvz_ptrs_svh = std::move(ptrs_svh);
@@ -253,6 +259,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
             add_gr(s.qkv, qkv_proj->bias.value(), s.qkv, graph);
     }
 
+    bool conv_fused = false;
     if (kda)
     {
         // KDA: three fp16 GEMVs off x (patched inputs), low-rank second stages and the gate op
@@ -280,30 +287,41 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
                 add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
         }
 
-        gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
-
-        gated_delta_net_fused_op_3_gr
+        // ba GEMV, beta/g, the qkv cast and the conv update as one launch where it takes the shape
+        conv_fused = gdn_conv_ba_update_gr
         (
-            s.qkv, s.ba,
-            dt_bias, a_log,
-            s.mixed_qkv, s.beta, s.g,
-            beta_scale,
-            graph
+            x, ba_weight_t, ba_bias, s.qkv, dt_bias, a_log,
+            conv_state, slots, conv1d_weight, conv1d_bias, s.conv_out,
+            s.beta, s.g, beta_scale, history, graph
         );
+        if (!conv_fused)
+        {
+            gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+
+            gated_delta_net_fused_op_3_gr
+            (
+                s.qkv, s.ba,
+                dt_bias, a_log,
+                s.mixed_qkv, s.beta, s.g,
+                beta_scale,
+                graph
+            );
+        }
     }
 
-    cuda_causal_conv1d_update_gr
-    (
-        s.mixed_qkv,
-        conv_state,
-        slots,
-        conv1d_weight,
-        conv1d_bias,
-        s.conv_out,
-        true,
-        history,
-        graph
-    );
+    if (!conv_fused)
+        cuda_causal_conv1d_update_gr
+        (
+            s.mixed_qkv,
+            conv_state,
+            slots,
+            conv1d_weight,
+            conv1d_bias,
+            s.conv_out,
+            true,
+            history,
+            graph
+        );
 
     cuda_recurrent_gated_delta_rule_gr
     (

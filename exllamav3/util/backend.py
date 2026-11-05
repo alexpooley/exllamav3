@@ -39,6 +39,10 @@ def _env(name: str, cuda, rocm):
 # Q/K/V projections as one sliced GEMM bundle (mgemm): the RDNA mgemv has no sliced form
 QKV_SLICE = _env("EXL3_QKV_SLICE", 1, 0) != "0"
 
+# Without slicing, the same bundles as whole matrices of unequal width (SlicedMultiLinear whole mode):
+# one multi-matrix GEMV launch pair in place of one pair per projection (RDNA)
+QKV_WHOLE = _env("EXL3_QKV_WHOLE", 0, 1) != "0"
+
 # int8-activation GEMV for mul1 tensors at small m (exl3_gemv_int8.cu, which holds the same default): off on
 # ROCm, where the RDNA fdot2 GEMVs are faster at these shapes
 INT8_GEMV_MODE = int(_env("EXL3_INT8_GEMV", 2, 0))

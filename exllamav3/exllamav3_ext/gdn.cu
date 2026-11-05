@@ -9,6 +9,7 @@
 #include "graph.cuh"
 #include "gdn.cuh"
 #include <cmath>
+#include <cstdlib>
 
 using bfloat16 = __nv_bfloat16;
 #define MAX_K_HEADS 32
@@ -2077,6 +2078,281 @@ void gdn_ba_gemv_gr
     }
 
     cuda_check(cudaPeekAtLastError());
+}
+
+// Split-projection (Qwen3.5) decode step, three launches in one: the ba GEMV
+// (gdn_ba_gemv_rows_kernel), the beta/g op and the bf16 cast of qkv
+// (gated_delta_net_fused_op_3_kernel), and the causal conv update
+// (conv1d_update_kernel, activation on, no incremental steps). The first
+// conv_blocks * bsz blocks are the conv kernel's blocks, reading the fp32 qkv
+// through the cast in place of mixed_qkv; the last H blocks each take one head:
+// its b and a columns of the GEMV, then beta and g for every row. Every value
+// is the one the three kernels compute (same arithmetic, same reduction order).
+// Graph sites: x (GP_gdn_ba_x) 0, conv_state 1, slots 2, in that order.
+
+template <bool HISTORY, int ROWS, typename a_log_T>
+__global__ __launch_bounds__(CONV1D_NUM_THREADS)
+void gdn_conv_ba_kernel
+(
+    const half* __restrict__ x,                 // 0: [ROWS, k] ba GEMV input
+    bfloat16* __restrict__ conv_state,          // 1: (num_slots, dim, state_size)
+    const int* __restrict__ slots,              // 2: (bsz)
+    const float* __restrict__ qkv,              // [bsz, seqlen, dim] float
+    const bfloat16* __restrict__ weight,        // (dim, K)
+    const bfloat16* __restrict__ bias,          // (dim) or null
+    bfloat16* __restrict__ out,                 // (bsz, seqlen, dim)
+    const half* __restrict__ ba_w_t,            // [2H, k]
+    const half* __restrict__ ba_bias,           // [2H] or null
+    const bfloat16* __restrict__ dt_bias,       // [H]
+    const a_log_T* __restrict__ a_log,          // [H]
+    bfloat16* __restrict__ out_beta,            // [ROWS, H]
+    float* __restrict__ out_g,                  // [ROWS, H]
+    const int dim,
+    const int seqlen,
+    const int state_size,
+    const int K,
+    const int k,
+    const int H,
+    const float beta_scale,
+    const int conv_blocks,
+    const int bsz
+)
+{
+    static_assert(CONV1D_NUM_THREADS == BA_GEMV_WARPS * 32, "gdn_conv_ba_kernel: block sizes differ");
+    if (blockIdx.x >= conv_blocks * bsz)
+    {
+        // ba GEMV for head h: columns h (b) and H + h (a), gdn_ba_gemv_rows_kernel's body
+        const int h = blockIdx.x - conv_blocks * bsz;
+        __shared__ float partial[2][BA_GEMV_WARPS][ROWS];
+        const int warp = threadIdx.x / 32;
+        const int lane = threadIdx.x % 32;
+        const int k8 = k / 8;
+        const uint4* x8 = (const uint4*) x;
+        #pragma unroll
+        for (int c = 0; c < 2; ++c)
+        {
+            const int col = c * H + h;
+            const uint4* w8 = (const uint4*) (ba_w_t + (size_t) col * k);
+            float acc[ROWS];
+            #pragma unroll
+            for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+            for (int j = threadIdx.x; j < k8; j += BA_GEMV_WARPS * 32)
+            {
+                const uint4 w = w8[j];
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r) acc[r] = ba_dot8(x8[(size_t) r * k8 + j], w, acc[r]);
+            }
+            #pragma unroll
+            for (int r = 0; r < ROWS; ++r)
+            {
+                float v = acc[r];
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    v += __shfl_down_sync(0xffffffff, v, offset);
+                if (lane == 0) partial[c][warp][r] = v;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < ROWS)
+        {
+            const int r = threadIdx.x;
+            float bv = 0.0f, av = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < BA_GEMV_WARPS; ++i) bv += partial[0][i][r];
+            #pragma unroll
+            for (int i = 0; i < BA_GEMV_WARPS; ++i) av += partial[1][i][r];
+            if (ba_bias)
+            {
+                bv += __half2float(ba_bias[h]);
+                av += __half2float(ba_bias[H + h]);
+            }
+            // gated_delta_net_fused_op_3_kernel
+            float beta = _sigmoid_fast_exp(bv) * beta_scale;
+            float dtb = as_float(dt_bias[h]);
+            float gv = -softplus(av + dtb) * __expf(as_float(a_log[h]));
+            out_beta[(size_t) r * H + h] = trunc_bf16(beta);
+            out_g[(size_t) r * H + h] = gv;
+        }
+        return;
+    }
+
+    // conv1d_update_kernel<true, HISTORY> with x_d[s] = trunc_bf16(qkv[b, s, d])
+    const int b = blockIdx.x / conv_blocks;
+    const int d = (blockIdx.x % conv_blocks) * CONV1D_NUM_THREADS + threadIdx.x;
+    if (d >= dim) return;
+    const int slot = slots ? slots[b] : b;
+    const float* x_d = qkv + (size_t) b * seqlen * dim + d;     // stride dim per step
+    bfloat16* state_d = conv_state + ((size_t) slot * dim + d) * state_size;
+    #define X_AT(t) __bfloat162float(trunc_bf16(x_d[(size_t) (t) * dim]))
+
+    float w[CONV1D_MAX_K];
+    #pragma unroll
+    for (int kk = 0; kk < CONV1D_MAX_K; ++kk)
+        if (kk < K) w[kk] = __bfloat162float(weight[(size_t) d * K + kk]);
+    float bias_d = bias ? __bfloat162float(bias[d]) : 0.0f;
+
+    float old_state[CONV1D_MAX_K];
+    float win[CONV1D_MAX_K];
+    #pragma unroll
+    for (int kk = 0; kk < CONV1D_MAX_K; ++kk)
+        if (kk < K) old_state[kk] = __bfloat162float(state_d[kk]);
+    #pragma unroll
+    for (int kk = 0; kk < CONV1D_MAX_K - 1; ++kk)
+        if (kk < K - 1) win[kk] = old_state[kk + 1];
+
+    const int last = K > 0 ? K - 1 : 0;
+    for (int st = 0; st < seqlen; ++st)
+    {
+        win[last] = X_AT(st);
+        float acc = bias_d;
+        #pragma unroll
+        for (int kk = 0; kk < CONV1D_MAX_K; ++kk)
+            if (kk < K) acc = fmaf(w[kk], win[kk], acc);
+        acc *= _sigmoid_fast_exp(acc);
+        out[((size_t) b * seqlen + st) * dim + d] = __float2bfloat16_rn(acc);
+        #pragma unroll
+        for (int kk = 0; kk < CONV1D_MAX_K - 1; ++kk)
+            if (kk < K - 1) win[kk] = win[kk + 1];
+    }
+
+    if constexpr (!HISTORY)
+    {
+        #pragma unroll
+        for (int kk = 0; kk < CONV1D_MAX_K; ++kk)
+        {
+            if (kk < K)
+            {
+                int src_t = seqlen + kk;
+                float v = (src_t < K) ? old_state[src_t] : X_AT(src_t - K);
+                state_d[kk] = __float2bfloat16_rn(v);
+            }
+        }
+    }
+    else
+    {
+        int total = K + seqlen;
+        int write_size = state_size < total ? state_size : total;
+        int dst_start = state_size - write_size;
+        int src_start = total - write_size;
+        for (int j = 0; j < write_size; ++j)
+        {
+            int src_t = src_start + j;
+            float v = (src_t < K) ? old_state[src_t] : X_AT(src_t - K);
+            state_d[dst_start + j] = __float2bfloat16_rn(v);
+        }
+    }
+    #undef X_AT
+}
+
+static bool gdn_conv_ba_enabled()
+{
+    static const bool on = []
+    {
+        const char* env = std::getenv("EXL3_GDN_CONV_BA");
+        return !env || atoi(env) != 0;
+    }();
+    return on;
+}
+
+template <bool HISTORY, int R, typename a_log_T>
+static bool gdn_conv_ba_try(int rows, dim3 grid, cudaStream_t stream, Graph* graph,
+    const half* x, bfloat16* conv_state, const int* slots, const float* qkv, const bfloat16* weight,
+    const bfloat16* bias, bfloat16* out, const half* ba_w_t, const half* ba_bias, const bfloat16* dt_bias,
+    const a_log_T* a_log, bfloat16* out_beta, float* out_g, int dim, int seqlen, int state_size, int K,
+    int k, int H, float beta_scale, int conv_blocks, int bsz)
+{
+    if constexpr (R > BA_GEMV_ROWS_MAX)
+        return false;
+    else
+    {
+        if (rows != R)
+            return gdn_conv_ba_try<HISTORY, R + 1, a_log_T>(rows, grid, stream, graph, x, conv_state, slots, qkv,
+                weight, bias, out, ba_w_t, ba_bias, dt_bias, a_log, out_beta, out_g, dim, seqlen, state_size, K,
+                k, H, beta_scale, conv_blocks, bsz);
+        gdn_conv_ba_kernel<HISTORY, R, a_log_T><<<grid, CONV1D_NUM_THREADS, 0, stream>>>
+        (
+            x, conv_state, slots, qkv, weight, bias, out, ba_w_t, ba_bias, dt_bias, a_log, out_beta, out_g,
+            dim, seqlen, state_size, K, k, H, beta_scale, conv_blocks, bsz
+        );
+        if (graph)
+        {
+            void* kp = (void*) &gdn_conv_ba_kernel<HISTORY, R, a_log_T>;
+            graph->record_param(kp, GP_gdn_ba_x, 0);
+            graph->record_param(kp, GP_conv1d_state, 1);
+            graph->record_param(kp, GP_conv1d_slots, 2);
+            graph->record_param(kp, GP_end, 0);
+        }
+        return true;
+    }
+}
+
+bool gdn_conv_ba_update_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& ba_w_t,
+    const c10::optional<at::Tensor>& ba_bias,
+    const at::Tensor& qkv,
+    const at::Tensor& dt_bias,
+    const at::Tensor& a_log,
+    at::Tensor& conv_state,
+    const c10::optional<at::Tensor>& slots,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor& out,
+    at::Tensor& beta,
+    at::Tensor& g,
+    const float beta_scale,
+    bool history,
+    Graph* graph
+)
+{
+    if (!gdn_conv_ba_enabled()) return false;
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    // Shapes the three-launch form takes, else decline (the caller runs it)
+    if (x.dtype() != at::kHalf || ba_w_t.dtype() != at::kHalf || qkv.dtype() != at::kFloat ||
+        dt_bias.dtype() != at::kBFloat16 || conv_state.dtype() != at::kBFloat16 ||
+        weight.dtype() != at::kBFloat16 || out.dtype() != at::kBFloat16 ||
+        beta.dtype() != at::kBFloat16 || g.dtype() != at::kFloat) return false;
+    if (ba_bias && ba_bias.value().dtype() != at::kHalf) return false;
+    if (bias && bias.value().dtype() != at::kBFloat16) return false;
+    if (!slots || slots.value().dtype() != at::kInt) return false;
+    if (!(x.is_contiguous() && ba_w_t.is_contiguous() && qkv.is_contiguous() && conv_state.is_contiguous() &&
+          weight.is_contiguous() && out.is_contiguous() && beta.is_contiguous() && g.is_contiguous())) return false;
+    bool a_log_fp32 = a_log.dtype() == at::kFloat;
+    if (!a_log_fp32 && a_log.dtype() != at::kBFloat16) return false;
+
+    int bsz = qkv.size(0);
+    int seqlen = qkv.size(1);
+    int dim = qkv.size(2);
+    int rows = bsz * seqlen;
+    int k = x.size(-1);
+    int H = beta.size(-1);
+    int state_size = conv_state.size(2);
+    int K = weight.size(1);
+    if (rows < 1 || rows > BA_GEMV_ROWS_MAX || x.numel() != (int64_t) rows * k) return false;
+    if (ba_w_t.dim() != 2 || ba_w_t.size(0) != 2 * H || ba_w_t.size(1) != k) return false;
+    if (k % 8 || (((uintptr_t) x.data_ptr() | (uintptr_t) ba_w_t.data_ptr()) & 15)) return false;
+    if (K > CONV1D_MAX_K || state_size < K || conv_state.size(1) != dim || weight.size(0) != dim) return false;
+    if (out.numel() != (int64_t) rows * dim || beta.numel() != (int64_t) rows * H || g.numel() != (int64_t) rows * H) return false;
+    if (slots.value().numel() != bsz) return false;
+
+    int conv_blocks = CEIL_DIVIDE(dim, CONV1D_NUM_THREADS);
+    dim3 grid(conv_blocks * bsz + H);
+    const bfloat16* bias_ptr = (const bfloat16*) OPTPTR(bias);
+    const half* ba_bias_ptr = (const half*) OPTPTR(ba_bias);
+
+    #define TRY(hist, T) gdn_conv_ba_try<hist, 1, T>(rows, grid, stream, graph, \
+        (const half*) x.data_ptr(), (bfloat16*) conv_state.data_ptr(), (const int*) slots.value().data_ptr(), \
+        (const float*) qkv.data_ptr(), (const bfloat16*) weight.data_ptr(), bias_ptr, (bfloat16*) out.data_ptr(), \
+        (const half*) ba_w_t.data_ptr(), ba_bias_ptr, (const bfloat16*) dt_bias.data_ptr(), (const T*) a_log.data_ptr(), \
+        (bfloat16*) beta.data_ptr(), (float*) g.data_ptr(), dim, seqlen, state_size, K, k, H, beta_scale, conv_blocks, bsz)
+    bool ok;
+    if (history) ok = a_log_fp32 ? TRY(true, float) : TRY(true, bfloat16);
+    else         ok = a_log_fp32 ? TRY(false, float) : TRY(false, bfloat16);
+    #undef TRY
+    if (ok) cuda_check(cudaPeekAtLastError());
+    return ok;
 }
 
 #define LR_GEMV_WARPS 8

@@ -134,7 +134,8 @@ struct BC_GatedDeltaNetSplit
     float qkvz_K = 0;
     bool qkvz_mcg = false;
     bool qkvz_mul1 = false;
-    at::Tensor qkvz_size_n, qkvz_n_stride, qkvz_had_src, qkvz_carrier;
+    at::Tensor qkvz_size_n, qkvz_carrier;
+    c10::optional<at::Tensor> qkvz_n_stride, qkvz_had_src;   // sliced mode only; whole mode (one entry per source) has neither
     void set_qkvz_bundle
     (
         at::Tensor ptrs_trellis,

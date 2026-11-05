@@ -6,7 +6,7 @@ from ..model.config import Config
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
-from ..util.backend import QKV_SLICE
+from ..util.backend import QKV_SLICE, QKV_WHOLE
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
 from ..cache import Cache
@@ -17,8 +17,10 @@ import os
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
 # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
-# the cooperative GEMM)
+# the cooperative GEMM). Without slicing, EXL3_QKV_WHOLE (on by default on ROCm) bundles the same projections
+# as whole matrices of unequal width (SlicedMultiLinear whole mode), which the RDNA GEMVs do take
 _qkv_slice_enable = QKV_SLICE
+_qkv_whole = not QKV_SLICE and QKV_WHOLE
 # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
 _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
 # Prefill projections (qkv, z, forget/beta gates) come out of the GEMM in fp16 rather than fp32.
@@ -941,13 +943,13 @@ class GatedDeltaNet(Module):
             # eager path (m <= 32) uses them directly
             self.multi_qkvz = None
             if (
-                _qkv_slice_enable and
+                (_qkv_slice_enable or _qkv_whole) and
                 self.qkv_proj.inner.bias is None and self.z_proj.inner.bias is None and
                 self.qkv_proj.inner.K == self.z_proj.inner.K and
                 self.qkv_proj.in_features == self.z_proj.in_features
             ):
                 try:
-                    self.multi_qkvz = SlicedMultiLinear(self.device, [self.qkv_proj, self.z_proj])
+                    self.multi_qkvz = SlicedMultiLinear(self.device, [self.qkv_proj, self.z_proj], whole = _qkv_whole)
                 except (ValueError, AssertionError):
                     self.multi_qkvz = None
                 # Unfusing policy judged on the slice width (see attn.py)

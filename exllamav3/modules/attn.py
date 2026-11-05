@@ -8,7 +8,7 @@ from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
-from ..util.backend import QKV_SLICE
+from ..util.backend import QKV_SLICE, QKV_WHOLE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
@@ -17,8 +17,10 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
 # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
-# the cooperative GEMM)
+# the cooperative GEMM). Without slicing, EXL3_QKV_WHOLE (on by default on ROCm) bundles the same projections
+# as whole matrices of unequal width (SlicedMultiLinear whole mode), which the RDNA GEMVs do take
 _qkv_slice_enable = QKV_SLICE
+_qkv_whole = not QKV_SLICE and QKV_WHOLE
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -507,7 +509,7 @@ class Attention(Module):
         if self.interleaved_gate and not (self.head_dim % 8 == 0 and self.g_proj is None):
             gate_ok = False
         if (
-            _qkv_slice_enable and
+            (_qkv_slice_enable or _qkv_whole) and
             not self.use_k_as_v and
             device != torch.device("cpu") and
             gate_ok and
@@ -518,7 +520,7 @@ class Attention(Module):
         ):
             linears = [self.q_proj, self.k_proj, self.v_proj] + ([self.g_proj] if self.g_proj is not None else [])
             try:
-                self.multi_qkv = SlicedMultiLinear(self.device, linears)
+                self.multi_qkv = SlicedMultiLinear(self.device, linears, whole = _qkv_whole)
             except (ValueError, AssertionError):
                 self.multi_qkv = None
             # The unfusing policy (int8 GEMV vs batched MGEMM) judges whether a matrix is wide

@@ -194,6 +194,28 @@ void gdn_ba_gemv_gr
     Graph* graph
 );
 
+// Split-projection decode step in one launch: ba GEMV + beta/g + qkv cast + causal conv update
+// (activation on, not incremental). false: shape not taken, nothing launched
+bool gdn_conv_ba_update_gr
+(
+    const at::Tensor& x,            // [rows, k] half
+    const at::Tensor& ba_w_t,       // [2H, k] half
+    const c10::optional<at::Tensor>& ba_bias,
+    const at::Tensor& qkv,          // [B,S,F] float
+    const at::Tensor& dt_bias,
+    const at::Tensor& a_log,
+    at::Tensor& conv_state,
+    const c10::optional<at::Tensor>& slots,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor& out,                // conv out [B,S,F] bfloat16
+    at::Tensor& beta,
+    at::Tensor& g,
+    const float beta_scale,
+    bool history,
+    Graph* graph
+);
+
 // Float-input fp16-weight GEMV for the KDA low-rank second stages (graph statics, no patching)
 void gdn_lowrank_gemv_f_gr
 (
