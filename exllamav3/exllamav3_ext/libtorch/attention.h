@@ -99,6 +99,7 @@ struct BC_Attention
     c10::optional<at::Tensor> qkv_n_stride, qkv_had_src;      // sliced mode only; whole mode (one entry per source) has neither
     at::Tensor qkv_carrier;   // (slices, MAX_R, width) zero-stride dtype/width carrier for the mgemm C argument
     int qkv_num_src = 0;
+    int qkv_max_rows = 32;
 
     // Head norms, fused into the RoPE kernel
     c10::optional<at::Tensor> q_norm;

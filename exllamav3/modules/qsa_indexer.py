@@ -90,8 +90,8 @@ class QSAIndexer(Module):
         self.k_layernorm = _sub("k_layernorm", lambda: RMSNorm(config, f"{key}.k_layernorm", rms_norm_eps, constant_bias = 1.0))
 
     # Tensor-parallel: the indexer is headless (one raw key head, per-token block selection shared
-    # by all attention heads) and small; it is replicated on the rank that holds its attention
-    # layer whole (Attention places QSA layers with max_devices = 1)
+    # by all attention heads) and small; it is replicated on every rank that holds heads of its
+    # attention layer, and every rank computes the same planes and selection
     _tp_submodules = ("index_qk_proj", "q_layernorm", "k_layernorm")
 
     def storage_size(self):

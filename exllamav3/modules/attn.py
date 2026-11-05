@@ -642,7 +642,7 @@ class Attention(Module):
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
 
-        if self.multi_qkv is not None and bsz * q_len <= 32:
+        if self.multi_qkv is not None and bsz * q_len <= self.multi_qkv.max_rows:
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
@@ -743,7 +743,7 @@ class Attention(Module):
 
 
     def project_qkv_sliced(self, x: torch.Tensor, bsz: int, q_len: int) -> tuple:
-        """All attention projections as one sliced mgemm (see SlicedMultiLinear); m <= 32 rows"""
+        """All attention projections as one sliced mgemm (see SlicedMultiLinear); m <= max_rows"""
         mq = self.multi_qkv
         m = bsz * q_len
         n_q, n_kv = self.num_q_heads * self.head_dim, self.num_kv_heads * self.head_dim
@@ -1249,30 +1249,29 @@ class Attention(Module):
         channel_width = 1
         channels_to_split = self.num_kv_heads
         max_devices = None
+        storage_per_device = 0
         if self.qsa_indexer is not None:
-            # QSA: the indexer's raw/pooled key planes and block selection are per token, and the
-            # sparse decode path reads all heads of a query row, so the layer runs whole on one
-            # rank (see MLAttention); the other ranks hold head-less stubs
-            storage += self.qsa_indexer.storage_size()
-            channel_width = self.num_kv_heads
-            channels_to_split = 1
-            max_devices = 1
-        else:
-            # EXL3 tensors split on 128-channel boundaries: widen the unit to as many K/V heads as
-            # it takes for the K/V slice width to be a multiple of 128 (e.g. head_dim 192 -> pairs)
-            while (channel_width * self.head_dim) % 128 != 0:
-                assert channels_to_split % 2 == 0, \
-                    "Model's K/V heads cannot divide into 128-channel tensors"
-                channel_width *= 2
-                channels_to_split //= 2
-            assert (channel_width * self.head_dim) % 128 == 0, \
+            # QSA: the indexer (one raw key head, a per-token block selection shared by all attention
+            # heads) is replicated on every rank that holds heads, with its raw/pooled key planes in
+            # that rank's cache layer. Every rank computes the same planes and the same selection from
+            # the same (replicated) input and attends with its own K/V heads, so the heads split like
+            # any other attention layer and the output goes through the all-reduce
+            storage_per_device += self.qsa_indexer.storage_size()
+        # EXL3 tensors split on 128-channel boundaries: widen the unit to as many K/V heads as
+        # it takes for the K/V slice width to be a multiple of 128 (e.g. head_dim 192 -> pairs)
+        while (channel_width * self.head_dim) % 128 != 0:
+            assert channels_to_split % 2 == 0, \
                 "Model's K/V heads cannot divide into 128-channel tensors"
+            channel_width *= 2
+            channels_to_split //= 2
+        assert (channel_width * self.head_dim) % 128 == 0, \
+            "Model's K/V heads cannot divide into 128-channel tensors"
         # TODO: Account for flash-attn temp VRAM usage
         tpa = TPAllocation(
             key = self.key,
             channel_width = channel_width,
             channel_unit = "heads",
-            storage_per_device = 0,
+            storage_per_device = storage_per_device,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
@@ -1332,7 +1331,7 @@ class Attention(Module):
                 "o_proj",
                 "g_proj",
             )},
-            # QSA indexer (Qwen3.8): replicated whole on the owning rank
+            # QSA indexer (Qwen3.8): replicated whole on every rank that holds heads
             "qsa_indexer": _export(self.qsa_indexer),
             # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
             "sinks": producer.send(self.sinks) if self.sinks is not None else None,
@@ -1407,7 +1406,6 @@ class Attention(Module):
 
         qsa_indexer = None
         if exported.get("qsa_indexer") is not None and num_kv_heads:
-            assert num_kv_heads == exported["num_kv_heads"], "QSA attention layers run whole on one device"
             qsa_indexer = _import("qsa_indexer")
 
         module = Attention(

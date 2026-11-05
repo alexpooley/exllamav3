@@ -305,7 +305,7 @@ class Qwen4ExpModel(Model):
 
         self.calibration_all_experts = True
         self.caps.update({
-            # QSA attention layers run whole on one device; PLE layers are replicated per rank
+            # QSA attention layers split by K/V head (indexer replicated); PLE layers are replicated per rank
             "supports_tp": True,
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
