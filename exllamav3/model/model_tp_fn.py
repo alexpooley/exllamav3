@@ -80,6 +80,14 @@ def mp_model_worker(
     # orchestrated by the parent ("quit" command) or the kernel (PDEATHSIG), never by SIGINT
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
+    # One intra-op thread. A worker's torch CPU ops are tiny (the CPU-resident token embedding's
+    # gather and dtype convert of the forward's rows); its heavy CPU work runs in the extension's
+    # own threads. With the inherited OMP pool (OMP_NUM_THREADS=6 in our runs) each such op woke
+    # pool threads that sleep between forwards on a busy host: a 16-row verify spent 4-9 ms in
+    # the embedding on rank 1 (gather 3.0-3.6 ms, convert 1.0-5.8 ms) while rank 0 waited in the
+    # first collective; one thread does both in ~20 us each. EXL3_TP_WORKER_THREADS overrides
+    torch.set_num_threads(int(os.environ.get("EXL3_TP_WORKER_THREADS", "1")))
+
     set_t0("TP", dbg_t0_)
     log_tp(device, f"Child process launched")
     if install_parent_death_signal():
