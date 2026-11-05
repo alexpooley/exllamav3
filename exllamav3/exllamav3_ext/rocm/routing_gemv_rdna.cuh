@@ -1,10 +1,10 @@
 #pragma once
 
-// RDNA router GEMV for m = 1..8 rows, taken by routing_gemv (routing.cu) on ROCm. Same arithmetic as
+// RDNA router GEMV for m = 1..16 rows, taken by routing_gemv (routing.cu) on ROCm. Same arithmetic as
 // routing_gemv_kernel (lane l owns the half2 columns j = l mod 32, accumulated in increasing j with the same
 // two fmaf per column, then the same shfl_down tree), so the scores are bit-identical to it; what changes is
 // the scheduling: several column loads in flight per lane, two-wave blocks spread over every CU, and, at
-// m == 1, 16-byte weight loads staged through LDS. Rows m = 2..8 (speculative verify steps) read the weights
+// m == 1, 16-byte weight loads staged through LDS. Rows m = 2..16 (speculative verify steps) read the weights
 // once for all rows.
 
 #include <cuda_fp16.h>
@@ -201,7 +201,7 @@ static inline bool routing_gemv_rdna_try(const at::Tensor& hidden, const at::Ten
     const int E = (int) scores.size(-1);
     if ((k & 1) || !hidden.is_contiguous() || !gate_t.is_contiguous()) return false;
     const int m = (int) (hidden.numel() / k);
-    if (m < 1 || m > 8 || scores.numel() != (int64_t) m * E) return false;
+    if (m < 1 || m > 16 || scores.numel() != (int64_t) m * E) return false;
 
     const half* xp = (const half*) hidden.data_ptr();
     const half* wp = (const half*) gate_t.data_ptr();
@@ -217,6 +217,7 @@ static inline bool routing_gemv_rdna_try(const at::Tensor& hidden, const at::Ten
     if (m == 1)      routing_gemv_rdna_kernel<1><<<grid, block, 0, stream>>>(xp, wp, sp, k, E, m);
     else if (m <= 2) routing_gemv_rdna_kernel<2><<<grid, block, 0, stream>>>(xp, wp, sp, k, E, m);
     else if (m <= 4) routing_gemv_rdna_kernel<4><<<grid, block, 0, stream>>>(xp, wp, sp, k, E, m);
-    else             routing_gemv_rdna_kernel<8><<<grid, block, 0, stream>>>(xp, wp, sp, k, E, m);
+    else if (m <= 8) routing_gemv_rdna_kernel<8><<<grid, block, 0, stream>>>(xp, wp, sp, k, E, m);
+    else             routing_gemv_rdna_kernel<16><<<grid, block, 0, stream>>>(xp, wp, sp, k, E, m);
     return true;
 }
