@@ -1280,7 +1280,9 @@ void gr_mix
     double rms_eps,
     at::Tensor dots,                     // (R, M + 1, H) float workspace
     c10::optional<at::Tensor> post,      // (R, H) float out, or none (final-mixer form)
-    at::Tensor mixed                     // (R, D) half or float out
+    at::Tensor mixed,                    // (R, D) half or float out
+    const c10::optional<at::Tensor>& pend_y,     // (R, D) half or float: a deferred apply on streams, or none
+    const c10::optional<at::Tensor>& pend_post   // (R, H) float: its gates (streams += pend_post * pend_y first)
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
@@ -1315,6 +1317,28 @@ void gr_mix
     TORCH_CHECK(D > 0, "gr_mix: norm over an empty stream dimension");
     if (!R) return;
     const half* w_p = (const half*) w.data_ptr();
+
+    // A deferred apply: the RDNA pair runs it on the fly (and writes the updated streams back); elsewhere it
+    // lands first as a plain hc_apply launch
+    const void* py_p = nullptr; const float* pp_p = nullptr; bool y_half = false;
+    if (pend_y)
+    {
+        TORCH_CHECK(pend_post && !wstreams, "gr_mix: pending apply needs its post and no weighted copy");
+        TORCH_CHECK(pend_y.value().is_contiguous() && pend_y.value().numel() == R * D, "gr_mix: pend_y shape");
+        TORCH_CHECK(pend_post.value().is_contiguous() && pend_post.value().numel() == R * H, "gr_mix: pend_post shape");
+        TORCH_CHECK_DTYPE(pend_post.value(), kFloat);
+        y_half = pend_y.value().dtype() == at::kHalf;
+        TORCH_CHECK(y_half || pend_y.value().dtype() == at::kFloat, "gr_mix: pend_y dtype");
+        py_p = pend_y.value().data_ptr(); pp_p = (const float*) pend_post.value().data_ptr();
+    }
+#if defined(USE_ROCM)
+    if (gr_mix_rdna_try((float*) streams.data_ptr(), ws_p, (const half*) fn.data_ptr(), (const half*) upt.data_ptr(), w_p,
+                        py_p, y_half, pp_p, (float*) dots.data_ptr(), post ? (float*) post.value().data_ptr() : nullptr,
+                        mixed.data_ptr(), mixed.dtype() == at::kHalf, M, LR, D, R, (float) rms_eps, stream))
+        return;
+#endif
+    if (py_p)
+        hc_apply(streams, pend_y.value(), pend_post.value(), c10::nullopt, c10::nullopt, c10::nullopt);
 
     const int nch = D / 256, nit = (LR + 63) / 64;
 #if defined(USE_ROCM)
