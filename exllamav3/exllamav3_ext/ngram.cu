@@ -5,6 +5,9 @@
 #include <pybind11/pybind11.h>
 #ifndef _WIN32
 #include <unistd.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
 #endif
 #include <algorithm>
 #include <thread>
@@ -293,9 +296,21 @@ void ngram_gather_cpu
     }
     size_t n_runs = runs.size();
 
-    if (n_runs == 1)
+    // Announce every run before reading any: POSIX_FADV_WILLNEED submits the page-cache fill and
+    // returns, so all cold reads are in flight at once from this thread, and the preads below then
+    // wait for at most one device latency in total. Without it a decode-sized gather (16 or 64
+    // single-row runs) depends on the pool's workers waking in time; on a loaded host (TP ranks and
+    // the CPU reduce helper spinning) they mostly do not, and the reads go out nearly one at a time
+    // (2026-11-05, xtx, NM790: 16 cold rows 1.48 ms one by one, 0.19 ms announced first; in a TP-ts
+    // MTP-3 run the PLE gather took 1.7 ms median, p90 5.1 ms)
+    for (auto& r : runs)
+        posix_fadvise(ctx.fd, (off_t) (base_offset + (up[r.first] - uid_base) * row_bytes),
+                      (off_t) (r.second * row_bytes), POSIX_FADV_WILLNEED);
+
+    // Decode-sized gathers then read in line: the pages are already on their way, and the pool
+    // round trip (worker wake/sleep) would only add latency
+    if (n_runs <= 64)
     {
-        // single contiguous read: no pool round trip
         GatherPool::read_span(&ctx, 0, U);
         TORCH_CHECK(!ctx.failed.load(), "ngram_gather_cpu: short read");
         return;
