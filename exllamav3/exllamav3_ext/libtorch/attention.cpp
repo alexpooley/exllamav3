@@ -156,6 +156,7 @@ BC_Attention::BC_Attention
         // unsliced per-matrix-width bundle, so no stride / source tables
         bool whole = slices == qkv_num_src;
         for (int j = 0; whole && j < slices; ++j) whole = meta[1][j].item<int>() == 0;
+        qkv_max_rows = whole ? 8 : 32;   // SlicedMultiLinear.max_rows
         if (!whole)
         {
             qkv_n_stride = meta.select(0, 3).contiguous().to(dev);
@@ -448,7 +449,7 @@ void BC_Attention::run_gr
     // Q (and gate) projections into the static buffers
     at::Tensor xh_q = xh_flat.narrow(0, 0, (int64_t) R * hs).view({R, hs});
     bool use_qg_mgemm = gate_mode == 2 && qg_ptrs_trellis.has_value() && R <= 32;
-    bool use_qkv = qkv_ptrs_trellis.has_value() && R <= 32;
+    bool use_qkv = qkv_ptrs_trellis.has_value() && R <= qkv_max_rows;
     if (use_qkv)
     {
         // Q, K, V (and a quantized full gate) as one sliced mgemm; the K/V section below is
@@ -919,7 +920,7 @@ void BC_Attention::run
     if (staged)
         params.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
 
-    bool use_qkv = qkv_ptrs_trellis.has_value() && R <= 32;
+    bool use_qkv = qkv_ptrs_trellis.has_value() && R <= qkv_max_rows;
 
     // Q / gate projections (an fp16 gate is a cublas node with no patchable sites)
     if (use_qkv)

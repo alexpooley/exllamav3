@@ -1406,7 +1406,7 @@ class GatedDeltaNet(Module):
             beta = beta.copy_(beta_k) if save_history else beta_k
             del beta_k
         else:
-            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
+            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= self.multi_qkvz.max_rows:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
                 qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)

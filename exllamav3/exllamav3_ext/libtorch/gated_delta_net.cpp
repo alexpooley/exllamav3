@@ -206,6 +206,7 @@ void BC_GatedDeltaNetSplit::set_qkvz_bundle
     // Whole mode (SlicedMultiLinear whole = True): one zero-offset entry per source, run as the
     // unsliced per-matrix-width bundle, so no stride / source tables
     bool whole = slices == 2 && meta[1][0].item<int>() == 0 && meta[1][1].item<int>() == 0;
+    qkvz_max_rows = whole ? 8 : 32;   // SlicedMultiLinear.max_rows
     qkvz_n_stride = whole ? c10::nullopt : c10::optional<at::Tensor>(meta.select(0, 3).contiguous().to(dev));
     qkvz_had_src = whole ? c10::nullopt : c10::optional<at::Tensor>(meta.select(0, 4).contiguous().to(dev));
     int width = meta.select(0, 2).max().item<int>();
@@ -237,7 +238,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
 )
 {
     int R = (int) (x.size(0) * x.size(1));
-    bool use_qkvz = qkvz_ptrs_trellis.has_value() && !kda && R <= 32;
+    bool use_qkvz = qkvz_ptrs_trellis.has_value() && !kda && R <= qkvz_max_rows;
 
     // qkv/z projections: bypass BC_LinearEXL3::run_gr, which hard-refuses graph capture above 1
     // row -- call exl3_gemm_gr directly with this slot's own xh scratch instead, exactly like

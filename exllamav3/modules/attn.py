@@ -642,7 +642,7 @@ class Attention(Module):
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
 
-        if self.multi_qkv is not None and bsz * q_len <= 32:
+        if self.multi_qkv is not None and bsz * q_len <= self.multi_qkv.max_rows:
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
@@ -743,7 +743,7 @@ class Attention(Module):
 
 
     def project_qkv_sliced(self, x: torch.Tensor, bsz: int, q_len: int) -> tuple:
-        """All attention projections as one sliced mgemm (see SlicedMultiLinear); m <= 32 rows"""
+        """All attention projections as one sliced mgemm (see SlicedMultiLinear); m <= max_rows"""
         mq = self.multi_qkv
         m = bsz * q_len
         n_q, n_kv = self.num_q_heads * self.head_dim, self.num_kv_heads * self.head_dim
