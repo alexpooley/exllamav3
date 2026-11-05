@@ -2,6 +2,7 @@ from __future__ import annotations
 from functools import cached_property
 from typing import Callable
 import gc
+import time
 import torch
 from .config import Config
 from ..util import parse_int_list
@@ -412,8 +413,11 @@ class Model(Model_TPMixin, Model_LSMixin):
                     params["draft_embedding"] = emb
                 return ids
             local = state
+            t0 = time.perf_counter() if sh is not None else None
             state = self.tp_producer.send(state)
             ids, conf = self.tp_dispatch_lm_head_argmax((state, {}), return_max = True)
+            if sh is not None:
+                sh.note_full_call(time.perf_counter() - t0)
             if flag == "probe":
                 sparse_ids, _ = sh.argmax(local.to(sh.device))
                 sh.record_probe(ids.to(sh.device), sparse_ids)
