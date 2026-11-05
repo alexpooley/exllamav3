@@ -57,7 +57,7 @@ def _quant_i8(t: torch.Tensor, g: int, dim: int):
 
 
 # Grid-barrier words for the one-launch GatedResidual decode site (gr_mix on ROCm), one zeroed pair per device;
-# the kernel leaves them as it found them, so graph replays and every site share them
+# the counter only grows (the kernel never resets it), so graph replays and every site share them
 _gr_site_bars = {}
 
 
