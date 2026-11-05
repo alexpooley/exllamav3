@@ -69,9 +69,9 @@
 int exl3_gemv_max_m()
 {
     const char* env = std::getenv("EXL3_GEMV_MAX_M");
-    if (!env) return 8;
+    if (!env) return 16;
     int v = atoi(env);
-    return v < 1 ? 1 : (v > 8 ? 8 : v);
+    return v < 1 ? 1 : (v > 16 ? 16 : v);
 }
 
 // m == 1 goes through this structure too, with a row tile of 1 -- rows read
@@ -694,7 +694,7 @@ void exl3_gemv_mr_dot_multi
 
 static inline int exl3_gemv_mr_row_tile(int size_m)
 {
-    return size_m <= 1 ? 1 : (size_m <= 2 ? 2 : (size_m <= 4 ? 4 : 8));
+    return size_m <= 1 ? 1 : (size_m <= 2 ? 2 : (size_m <= 4 ? 4 : (size_m <= 8 ? 8 : 16)));
 }
 
 // Split-K wave count: the m == 1 rule (shape-aware; EXL3_GEMV_SPLITK_WARPS
@@ -722,6 +722,7 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
         case 2: LAUNCH_MR_M(bits_val, codebook, warps_val, 2, kernel_name, __VA_ARGS__) break; \
         case 4: LAUNCH_MR_M(bits_val, codebook, warps_val, 4, kernel_name, __VA_ARGS__) break; \
         case 8: LAUNCH_MR_M(bits_val, codebook, warps_val, 8, kernel_name, __VA_ARGS__) break; \
+        case 16: LAUNCH_MR_M(bits_val, codebook, warps_val, 16, kernel_name, __VA_ARGS__) break; \
     }
 #define LAUNCH_MR_CB(bits_val, codebook, kernel_name, ...) \
     switch (warps) { \

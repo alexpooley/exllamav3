@@ -200,9 +200,9 @@ int exl3_gemm_gr
     }
 
 #if defined(USE_ROCM)
-    // RDNA: m = 1..8 take the multi-row fdot2 GEMV (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
+    // RDNA: m = 1..16 take the multi-row fdot2 GEMV (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
     // capture, ahead of every other path. Half-integer rates go as the pseudo width EXL3_HALF_BITS(K)
-    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= 8
+    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= 16
         && (!half_k || exl3_rocm_half_gemv_enabled()))
     {
         if (exl3_gemv_multirow_try_launch
@@ -665,9 +665,9 @@ int exl3_mgemm_gr
 
 #if defined(USE_ROCM)
     // RDNA: the plain-launch multi-matrix GEMVs (rocm/quant/exl3_mgemv_rdna.cu, exl3_gemv_multirow_rdna.cu)
-    // take m = 1..8 ahead of the cooperative kernel. Sliced mode is per-source strided, which they do not
+    // take m = 1..16 ahead of the cooperative kernel. Sliced mode is per-source strided, which they do not
     // handle, so it stays on the cooperative kernel
-    if (size_m >= 1 && size_m <= 8 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list
+    if (size_m >= 1 && size_m <= 16 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list
         && (!half_k || exl3_rocm_half_gemv_enabled()))
     {
         if (exl3_mgemv_multirow_try_launch

@@ -110,11 +110,11 @@ class SlicedMultiLinear:
                 strides.append(l.out_features)
                 srcs.append(i)
         self.num_slices = len(targets)
-        # Rows the bundle may take. Whole mode runs on the RDNA multi-matrix GEMVs only up to m = 8;
-        # above that exl3_mgemm falls to the cooperative kernel, which picks its tile width from the
+        # Rows the bundle may take. Whole mode runs on the RDNA multi-matrix GEMVs only up to m = 16
+        # (EXL3_GEMV_MAX_M); above that exl3_mgemm falls to the cooperative kernel, which picks its tile width from the
         # widest matrix and so skips a matrix narrower than one tile (6144/256/256 at m = 16 left k
         # and v unwritten). Sliced mode has equal-width slices and holds to m = 32
-        self.max_rows = 8 if whole else 32
+        self.max_rows = 16 if whole else 32
         self.slice_targets = targets
         self.slice_offsets = offsets
 
