@@ -12,7 +12,7 @@ from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
 
-MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
+MAX_BSZN = 16  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
 
 def gated_act_slopes(activation_fn: str, g: torch.Tensor, u: torch.Tensor, act_limit: float):
