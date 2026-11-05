@@ -566,15 +566,17 @@ __device__ __forceinline__ void grs_grid_barrier(unsigned* bar, unsigned nb)
 
 // D: hidden, LR: low rank, POST: site form (M = LR + H proj rows) vs final mixer (M = LR)
 // APPLY: fold the previous site's apply (x += pp * y); y is Y_T
-template <int H, int D, int LR, bool POST, bool APPLY, typename Y_T>
-__global__ __launch_bounds__(GRS_NT)
+template <int H, int D, int LR, bool POST, bool APPLY, typename Y_T, bool I8>
+__global__ __launch_bounds__(GRS_NT) __attribute__((amdgpu_waves_per_eu(8, 8)))
 void gr_site_kernel
 (
     float* __restrict__ x,               // (H, D) raw streams, updated in place when APPLY
     const Y_T* __restrict__ y,           // (D)
     const float* __restrict__ pp,        // (H)
-    const half* __restrict__ fn,         // (M, H * D)
-    const half* __restrict__ upt,        // (H, D / 4, LR, 4)
+    const void* __restrict__ fn,         // (M, H * D) half, or int8 (I8)
+    const half* __restrict__ fn_s,       // (M, H * D / 128) group scales (I8)
+    const void* __restrict__ upt,        // (H, D / 4, LR, 4) half, or int8 (I8)
+    const half* __restrict__ upt_s,      // (H, D / 4, LR / 64, 4) group scales (I8)
     const half* __restrict__ w,          // (H * D)
     float* __restrict__ dots,            // (M * H) workspace
     float* __restrict__ post,            // (H) out (POST)
@@ -641,13 +643,41 @@ void gr_site_kernel
     }
 
     // Phase 0b: weight loads (activation-independent)
-    int4 fa[KC];
+    // fp16: 8 columns per int4 (KC per lane); int8: 16 columns per int4 (KQ per lane), one scale per 128
+    constexpr int KQ = D / 16 / 32;
+    int4 fa[I8 ? KQ : KC];
+    half fsc[I8 ? KQ : 1];
     {
-        const int4* ra = (const int4*) (fn + (size_t) min(pa, NPAIR - 1) * D);
-        #pragma unroll
-        for (int k = 0; k < KC; ++k) fa[k] = ra[lane + 32 * k];
+        const int pc = min(pa, NPAIR - 1);
+        if constexpr (I8)
+        {
+            const int4* ra = (const int4*) ((const int8_t*) fn + (size_t) pc * D);
+            #pragma unroll
+            for (int k = 0; k < KQ; ++k) fa[k] = ra[lane + 32 * k];
+            #pragma unroll
+            for (int k = 0; k < KQ; ++k) fsc[k] = fn_s[(size_t) pc * (D / 128) + (lane + 32 * k) / 8];
+        }
+        else
+        {
+            const int4* ra = (const int4*) ((const half*) fn + (size_t) pc * D);
+            #pragma unroll
+            for (int k = 0; k < KC; ++k) fa[k] = ra[lane + 32 * k];
+        }
     }
-    int4 u[NIT][H];
+    // up: lane ranks 2 lane + 64 it and the next, 4 columns: 16 bytes fp16 or 8 bytes int8 (scale per 64 ranks:
+    // one per (it, h, column), uniform across the warp)
+    int4 u[I8 ? 1 : NIT][H];
+    int2 u8[I8 ? NIT : 1][H];
+    __shared__ int2 usc_s[I8 ? 8 * H * NIT : 1];        // this block's up scales (<= 8 quads), 4 halves each
+    if constexpr (I8)
+    {
+        const int nq = q1 - q0;
+        if (tid < nq * H * NIT)
+        {
+            const int qi = tid / (H * NIT), r = tid % (H * NIT), h = r / NIT, it = r % NIT;
+            usc_s[tid] = *(const int2*) (upt_s + (((size_t) h * D4 + q0 + qi) * NIT + it) * 4);
+        }
+    }
     const int qcl = min(qc, D4 - 1);
     if (warp < 8)
     {
@@ -655,7 +685,14 @@ void gr_site_kernel
         for (int it = 0; it < NIT; ++it)
             #pragma unroll
             for (int h = 0; h < H; ++h)
-                u[it][h] = *(const int4*) (upt + ((((size_t) h * D4 + qcl) * LR + 2 * lane + 64 * it) * 4));
+            {
+                const size_t e = (((size_t) h * D4 + qcl) * LR + 2 * lane + 64 * it) * 4;
+                if constexpr (I8)
+                {
+                    u8[it][h] = *(const int2*) ((const int8_t*) upt + e);
+                }
+                else u[it][h] = *(const int4*) ((const half*) upt + e);
+            }
     }
 
     // Build the updated weighted stack + per-thread sums of squares
@@ -702,6 +739,28 @@ void gr_site_kernel
             const int h = p % H;
             const float4* s = sw4 + h * D4;
             float a = 0.0f;
+            if constexpr (I8)
+            {
+                #pragma unroll
+                for (int k = 0; k < KQ; ++k)
+                {
+                    const int c16 = lane + 32 * k;
+                    const int* q4 = (const int*) &f[k];
+                    float pk = 0.0f;
+                    #pragma unroll
+                    for (int v = 0; v < 4; ++v)
+                    {
+                        const float4 sv = s[4 * c16 + v];
+                        const int q = q4[v];
+                        pk = fmaf(sv.x, (float) (int8_t) (q), pk);
+                        pk = fmaf(sv.y, (float) (int8_t) (q >> 8), pk);
+                        pk = fmaf(sv.z, (float) (int8_t) (q >> 16), pk);
+                        pk = fmaf(sv.w, (float) (int8_t) (q >> 24), pk);
+                    }
+                    a = fmaf(__half2float(fsc[k]), pk, a);
+                }
+                return hc_warp_sum_lane0(a);
+            }
             #pragma unroll
             for (int k = 0; k < KC; ++k)
             {
@@ -780,6 +839,25 @@ void gr_site_kernel
     {
         const float t0 = t_s[2 * lane + 64 * it];
         const float t1 = t_s[2 * lane + 64 * it + 1];
+        if constexpr (I8)
+        {
+            #pragma unroll
+            for (int h = 0; h < H; ++h)
+            {
+                const int qa = u8[it][h].x, qb = u8[it][h].y;      // rank i: 4 columns, rank i + 1: 4 columns
+                const int2 usv = usc_s[(warp * H + h) * NIT + it];
+                const half2* us2 = (const half2*) &usv;
+                const float2 s01 = __half22float2(us2[0]), s23 = __half22float2(us2[1]);
+                const float sc[4] = { s01.x, s01.y, s23.x, s23.y };
+                #pragma unroll
+                for (int e = 0; e < 4; ++e)
+                {
+                    const float pe = fmaf(t1, (float) (int8_t) (qb >> (8 * e)), t0 * (float) (int8_t) (qa >> (8 * e)));
+                    g[h][e] = fmaf(sc[e], pe, g[h][e]);
+                }
+            }
+            continue;
+        }
         #pragma unroll
         for (int h = 0; h < H; ++h)
         {
@@ -816,12 +894,12 @@ void gr_site_kernel
     out2[qc * 2 + 1] = __floats2half2_rn(o.z, o.w);
 }
 
-
 // Launch a site kernel on a grid of co-resident blocks: as many as the device holds at once (occupancy x
 // multiprocessors; gfx11 reports WGPs), capped at 96. The work split needs >= 81 blocks; false otherwise.
 template <typename K, typename Y_T>
-static bool gr_site_launch(K kernel, float* x, const Y_T* y, const float* pp, const half* fn, const half* upt,
-                           const half* w, float* dots, float* post, half* mixed, unsigned* bar, float eps, cudaStream_t stream)
+static bool gr_site_launch(K kernel, float* x, const Y_T* y, const float* pp, const void* fn, const half* fn_s,
+                           const void* upt, const half* upt_s, const half* w, float* dots, float* post, half* mixed,
+                           unsigned* bar, float eps, cudaStream_t stream)
 {
     int dev; cudaGetDevice(&dev);
     static int nbs[16][8] = { { 0 } };
@@ -846,7 +924,7 @@ static bool gr_site_launch(K kernel, float* x, const Y_T* y, const float* pp, co
     }
     const int nb = nbs[dev][slot];
     if (nb < 0) return false;
-    kernel<<<nb, GRS_NT, 0, stream>>>(x, y, pp, fn, upt, w, dots, post, mixed, bar, eps);
+    kernel<<<nb, GRS_NT, 0, stream>>>(x, y, pp, fn, fn_s, upt, upt_s, w, dots, post, mixed, bar, eps);
     cuda_check(cudaPeekAtLastError());
     return true;
 }
@@ -872,8 +950,8 @@ static bool gr_mix_rdna_try
     {
         const bool apply = py != nullptr;
         bool done = false;
-        #define SITE(POST_, AP, Y_T) done = gr_site_launch(gr_site_kernel<4, 2560, 320, POST_, AP, Y_T>, \
-            s_p, (const Y_T*) py, ppost, fn_p, upt_p, w_p, dots_p, post_p, (half*) mixed_p, bar, rms_eps, stream)
+        #define SITE(POST_, AP, Y_T) done = gr_site_launch(gr_site_kernel<4, 2560, 320, POST_, AP, Y_T, false>, \
+            s_p, (const Y_T*) py, ppost, fn_p, nullptr, upt_p, nullptr, w_p, dots_p, post_p, (half*) mixed_p, bar, rms_eps, stream)
         #define SITE_P(POST_) if (!apply) SITE(POST_, false, float); else if (y_half) SITE(POST_, true, half); else SITE(POST_, true, float);
         if (post_p) { SITE_P(true) } else { SITE_P(false) }
         #undef SITE_P
@@ -919,4 +997,28 @@ static bool gr_mix_rdna_try
     #undef FIN2
     cuda_check(cudaPeekAtLastError());
     return true;
+}
+
+
+// Site kernel with int8 tables (symmetric absmax, one fp16 scale per 128 proj columns along H * D and per 64 up
+// ranks per output channel; GatedResidual quantizes them at load under EXL3_GR_I8). R = 1, the Qwen3.8 shape
+// only; false (nothing launched) otherwise, and the caller takes the fp16 path.
+static bool gr_site_i8_try
+(
+    float* s_p, const void* py, bool y_half, const float* ppost,
+    const int8_t* fn_q, const half* fn_s, const int8_t* upt_q, const half* upt_s, const half* w_p,
+    float* dots_p, float* post_p, half* mixed_p, unsigned* bar,
+    const int LR, const int D, const int R, const float rms_eps, cudaStream_t stream
+)
+{
+    if (R != 1 || D != 2560 || LR != 320 || !bar) return false;
+    const bool apply = py != nullptr;
+    bool done = false;
+    #define SITE(POST_, AP, Y_T) done = gr_site_launch(gr_site_kernel<4, 2560, 320, POST_, AP, Y_T, true>, \
+        s_p, (const Y_T*) py, ppost, fn_q, fn_s, upt_q, upt_s, w_p, dots_p, post_p, mixed_p, bar, rms_eps, stream)
+    #define SITE_P(POST_) if (!apply) SITE(POST_, false, float); else if (y_half) SITE(POST_, true, half); else SITE(POST_, true, float);
+    if (post_p) { SITE_P(true) } else { SITE_P(false) }
+    #undef SITE_P
+    #undef SITE
+    return done;
 }

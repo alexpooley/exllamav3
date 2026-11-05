@@ -147,6 +147,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
+    #if defined(USE_ROCM)
+    m.def("gr_mix_i8", &gr_mix_i8, "gr_mix_i8");
+    #endif
     m.def("gr_mix_tiled", &gr_mix_tiled, "gr_mix_tiled");
     m.def("gr_mix_tiled_slices", &gr_mix_tiled_slices, "gr_mix_tiled_slices");
     m.def("routing_std", &routing_std, "routing_std");

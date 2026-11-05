@@ -123,3 +123,22 @@ void gr_mix_tiled
     c10::optional<at::Tensor> post,
     at::Tensor mixed
 );
+
+#if defined(USE_ROCM)
+bool gr_mix_i8
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn_q,
+    const at::Tensor& fn_s,
+    const at::Tensor& upt_q,
+    const at::Tensor& upt_s,
+    const at::Tensor& w,
+    double rms_eps,
+    at::Tensor dots,
+    c10::optional<at::Tensor> post,
+    at::Tensor mixed,
+    const c10::optional<at::Tensor>& pend_y,
+    const c10::optional<at::Tensor>& pend_post,
+    const at::Tensor& bar
+);
+#endif

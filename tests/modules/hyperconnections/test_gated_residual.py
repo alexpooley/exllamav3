@@ -345,3 +345,41 @@ def test_site_kernel_r1(device, use_combine):
         assert rel(outs[0][0], ref_post.view(1, 4)) < 1e-3
     for o in outs[1:]:
         assert torch.equal(o[1], outs[0][1]) and (not use_combine or torch.equal(o[0], outs[0][0]))
+
+
+@pytest.mark.skipif(not torch.version.hip or not hasattr(ext, "gr_mix_i8"), reason = "ROCm int8 site kernel")
+@pytest.mark.parametrize("use_combine", [True, False])
+def test_site_kernel_i8(device, use_combine, monkeypatch):
+    # EXL3_GR_I8: the site kernel on the int8 tables matches an fp32 evaluation of the dequantized tables (so the
+    # kernel's int8 arithmetic is exact up to fp32 rounding), folded apply included; bits reproducible run to run
+    monkeypatch.setattr(hcmod, "_gr_i8", True)
+    H, D, LR = 4, 2560, 320
+    m = make_site(device, D, LR, use_combine)
+    assert m.proj_q is not None
+    pdq = (m.proj_q.float().view(m.proj_m, -1, 128) * m.proj_s.float().unsqueeze(-1)).view(m.proj_m, H * D)
+    udq = (m.upx_q.float().view(H, D // 4, LR // 64, 64, 4) * m.upx_s.float().unsqueeze(3)).view(H, D // 4, LR, 4)
+    up = udq.permute(0, 1, 3, 2).reshape(H * D, LR)
+    torch.manual_seed(5)
+    x0 = torch.randn(1, 1, H, D, device = device) * 3.0
+    y = torch.randn(1, D, device = device)
+    pp = torch.rand(1, H, device = device) * 2
+    xr = x0 + pp.view(1, 1, H, 1) * y.view(1, 1, 1, D)
+    xf = xr.float()
+    normed = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim = True) + m.rms_eps) * m.norm_w
+    flat = normed.flatten(-2)
+    dm = flat @ pdq.t()
+    tt = torch.nn.functional.silu(dm[..., :LR] / H)
+    w = torch.sigmoid(tt @ up.t())
+    ref_mixed = (w.unflatten(-1, (H, D)) * normed).mean(dim = -2).view(1, D)
+    ref_post = 2.0 * torch.sigmoid(dm[..., LR:] / H).view(1, H) if use_combine else None
+    outs = []
+    for _ in range(2):
+        x = x0.clone()
+        params = {"hc_pending": (x, y, pp, None)}
+        post, mixed = m._mix(x, cached = False, params = params)
+        outs.append((x.clone(), mixed.clone(), post.clone() if post is not None else None))
+        assert rel(x, xr) < 1e-6
+    assert rel(outs[0][1], ref_mixed) < 1e-3
+    if use_combine:
+        assert rel(outs[0][2], ref_post) < 1e-4
+    assert torch.equal(outs[0][1], outs[1][1]) and torch.equal(outs[0][0], outs[1][0])
