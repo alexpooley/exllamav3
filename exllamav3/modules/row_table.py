@@ -29,6 +29,22 @@ MAX_PIN_SETS = 2            # staging sets: one with the last forward's uploads 
 INLINE_MAX_ROWS = 16        # rows of a table that gets read-ahead hints, below which a gather reads in line
 
 
+def _merge_contiguous(key: str, handles: list) -> list:
+    """Shards that sit back-to-back in one file (the layout convert_ngram.py writes) collapse into a
+    single handle spanning the whole table: _gather_rows issues one synchronous gather call per
+    handle segment. Returns the handles unchanged (the same list) when they cannot merge."""
+    h0 = handles[0]
+    if len(handles) > 1 and all(
+        h.filename == h0.filename and h.row_bytes == h0.row_bytes and
+        h.abs_offset == h0.abs_offset + s * h0.num_rows * h0.row_bytes
+        for s, h in enumerate(handles)
+    ):
+        rows = sum(h.num_rows for h in handles)
+        return [DiskTensorHandle(key = key, filename = h0.filename, abs_offset = h0.abs_offset,
+                                 shape = [rows, *h0.row_shape], dtype = h0.dtype)]
+    return handles
+
+
 class _PinSet:
     """Pinned staging buffers for one resolve + gather: unique row ids, the inverse map, the
     per-row head index and the stored rows. `held` while a queued prefetch or a running lookup
@@ -109,21 +125,10 @@ class RowTable:
             prepare_host_lock(nbytes, f"Locking {self.key} in RAM")
         handles = [stc.get_tensor_handle(k, optional = True) for k in keys] if stream_from_disk else [None]
         if all(h is not None for h in handles):
-            # Shards that sit back-to-back in one file (the layout convert_ngram.py writes)
-            # collapse into a single handle spanning the whole table: _gather_rows issues one
-            # synchronous gather call per handle segment
-            h0 = handles[0]
-            rows = sum(h.num_rows for h in handles)
-            if len(handles) > 1 and all(
-                h.filename == h0.filename and h.row_bytes == h0.row_bytes and
-                h.abs_offset == h0.abs_offset + s * h0.num_rows * h0.row_bytes
-                for s, h in enumerate(handles)
-            ):
-                merged = DiskTensorHandle(
-                    key = self.key, filename = h0.filename, abs_offset = h0.abs_offset,
-                    shape = [rows, *h0.row_shape], dtype = h0.dtype)
-                stc.find_stc(keys[0]).disk_handles.append(merged)   # closed with the collection
-                handles = [merged]
+            merged = _merge_contiguous(self.key, handles)
+            if merged is not handles:
+                stc.find_stc(keys[0]).disk_handles.append(merged[0])   # closed with the collection
+                handles = merged
             if os.name == "nt":
                 # Release the loader's handles to the table files now
                 for f in set(h.filename for h in handles):
@@ -179,11 +184,14 @@ class RowTable:
     @staticmethod
     def from_export(exported: dict) -> RowTable:
         table = RowTable(exported["key"], exported["keys"])
-        table._set_stores([
+        # Merged as in open(): unmerged, a decode gather of 64 rows spread over the 128 shards of
+        # Qwen3.8-Flash-Next's table ran as ~60 one-row gather calls in a row, each waiting for its
+        # own cold read (4.5 ms per verify forward on the PLE rank, vs 0.5 ms for one call)
+        table._set_stores(_merge_contiguous(exported["key"], [
             DiskTensorHandle(key = k, filename = fn, abs_offset = off, shape = shape,
                              dtype = getattr(torch, d.split(".")[1]))
             for k, fn, off, shape, d in exported["handles"]
-        ])
+        ]))
         return table
 
     def fetch(self, uids_cpu: torch.Tensor) -> torch.Tensor:
