@@ -422,6 +422,32 @@ class SparseHead:
             self.n_active = n_active
 
 
+    def benchmark_sparse(self, iters: int = 20):
+        """Time the sparse argmax only (t_full then comes from note_full_call)"""
+        x = torch.randn((1, 1, self.k), dtype = torch.half, device = self.device)
+        n_active = self.n_active
+        self.n_active = max(n_active, 1)
+        try:
+            for _ in range(3):
+                self.argmax(x)
+            torch.cuda.synchronize(self.device)
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                self.argmax(x)
+            torch.cuda.synchronize(self.device)
+            self.t_sparse = (time.perf_counter() - t0) / iters
+        finally:
+            self.n_active = n_active
+
+
+    def note_full_call(self, seconds: float):
+        """Host time of one full-head argmax (a tensor-parallel head: dispatch, gather and the final pick)"""
+        if self.t_full is None:
+            self.t_full = seconds
+        else:
+            self.t_full += _ROUND_EMA * (seconds - self.t_full)
+
+
     def note_round(self, seconds: float, drafted: int, head_calls: int):
         """One speculative round: wall time (draft and verification), draft tokens, head invocations"""
         if self.round_time is None:

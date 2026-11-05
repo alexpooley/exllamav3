@@ -450,7 +450,10 @@ class Generator:
                 profile_path = token_stats_path(model.config.directory, model.config.vocab_size),
                 with_embedding = self.mtp_draft,
             )
-            self.sparse_head.benchmark(full_fn = lambda x: model.lm_head_argmax(x, {}))
+            # No TP collective at construction (a full-head argmax here segfaulted TabbyAPI's model load in
+            # gather_small, 2 of 3 starts): time the local sparse argmax now, the TP full head from the
+            # drafting loop's own full-head calls (model.lm_head_argmax)
+            self.sparse_head.benchmark_sparse()
         elif sparse_draft_head and self.draft_model is not None and not model.loaded_tp:
             from ..modules.sparse_head import token_stats_path
             # Drafters with a head of their own (Gemma4 assistant) take the subset there; the others borrow the
