@@ -156,7 +156,7 @@ BC_Attention::BC_Attention
         // unsliced per-matrix-width bundle, so no stride / source tables
         bool whole = slices == qkv_num_src;
         for (int j = 0; whole && j < slices; ++j) whole = meta[1][j].item<int>() == 0;
-        qkv_max_rows = whole ? 8 : 32;   // SlicedMultiLinear.max_rows
+        qkv_max_rows = whole ? 16 : 32;   // SlicedMultiLinear.max_rows
         if (!whole)
         {
             qkv_n_stride = meta.select(0, 3).contiguous().to(dev);

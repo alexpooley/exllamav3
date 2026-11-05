@@ -13,7 +13,7 @@
 
 class Graph;
 
-// EXL3_GEMV_MAX_M (default 8, clamp 1..8): the largest m the multi-row GEMV
+// EXL3_GEMV_MAX_M (default 16, clamp 1..16): the largest m the multi-row GEMV (row tiles 1, 2, 4, 8, 16)
 // takes; 1 switches the path off. Re-read per call.
 int exl3_gemv_max_m();
 
