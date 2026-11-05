@@ -525,8 +525,8 @@ void gr_finalize2_kernel
 // launch. Phase 0 issues the block's share of the stream stack (L2) and then its proj dot rows and up column
 // quads (activation-independent, the whole 13 MB table in flight at once) and builds the updated, weighted stack
 // in LDS plus the per-stream sums of squares (every block, same order). Phase 1: one warp per (proj row j,
-// stream h) pair against the LDS stack. A grid barrier (counter + generation in a zeroed 2-word buffer,
-// self-resetting, so graph replays work) separates it from phase 2: every block derives rmr and t from the dots
+// stream h) pair against the LDS stack. A grid barrier (a monotonic 64-bit counter in a zeroed 2-word buffer, never
+// reset, so graph replays work) separates it from phase 2: every block derives rmr and t from the dots
 // in a fixed order, one warp per column quad finishes mixed and writes the updated streams back. The grid is
 // one block per CU (co-resident: 512 threads, ~190 VGPRs, 43 KB LDS). No float atomics: run-to-run
 // bit-reproducible; dots differ from the pair only in summation order.
@@ -543,22 +543,21 @@ __device__ __forceinline__ float grs_xor_sum32(float v)
     return v;
 }
 
+// Grid barrier on a monotonic 64-bit arrival counter (the 8 zeroed bytes of bar, never reset): each block adds 1
+// and waits until the count reaches the end of its own round of nb arrivals. A stale read of the counter can only
+// be lower than the truth, so it delays and never releases early. (A counter + generation scheme released early
+// about once per 250 launches on gfx1100: the plain glc load of the generation can hit a stale GL1 line.)
 __device__ __forceinline__ void grs_grid_barrier(unsigned* bar, unsigned nb)
 {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     __syncthreads();
     if (threadIdx.x == 0)
     {
-        unsigned gen = __hip_atomic_load(&bar[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        unsigned arrived = __hip_atomic_fetch_add(&bar[0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
-        if (arrived == nb - 1)
-        {
-            __hip_atomic_store(&bar[0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-            __hip_atomic_fetch_add(&bar[1], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-        }
-        else
-            while (__hip_atomic_load(&bar[1], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == gen)
-                __builtin_amdgcn_s_sleep(1);
+        unsigned long long* cnt = (unsigned long long*) bar;
+        const unsigned long long old = __hip_atomic_fetch_add(cnt, 1ull, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        const unsigned long long target = (old / nb + 1) * nb;
+        while (__hip_atomic_load(cnt, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target)
+            __builtin_amdgcn_s_sleep(1);
     }
     __syncthreads();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -778,7 +777,7 @@ void gr_site_kernel
         };
         __syncthreads();
         float da = dot(min(pa, NPAIR - 1), fa);
-        if (has_a && lane == 0) dots[pa] = da;
+        if (has_a && lane == 0) __hip_atomic_store(dots + pa, da, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
 
     // Quad epilogue inputs (independent of the dots)
@@ -817,7 +816,7 @@ void gr_site_kernel
     {
         float v = 0.0f;
         #pragma unroll
-        for (int h = 0; h < H; ++h) v = fmaf(rmr_s[h], dots[i * H + h], v);
+        for (int h = 0; h < H; ++h) v = fmaf(rmr_s[h], __hip_atomic_load(dots + i * H + h, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), v);
         v *= inv_h;
         t_s[i] = v * sigmoidf_(v);
     }
@@ -825,7 +824,7 @@ void gr_site_kernel
     {
         float v = 0.0f;
         #pragma unroll
-        for (int h = 0; h < H; ++h) v = fmaf(rmr_s[h], dots[(LR + tid) * H + h], v);
+        for (int h = 0; h < H; ++h) v = fmaf(rmr_s[h], __hip_atomic_load(dots + (LR + tid) * H + h, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), v);
         post[tid] = 2.0f * sigmoidf_(v * inv_h);
     }
     __syncthreads();

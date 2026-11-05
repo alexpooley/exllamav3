@@ -383,3 +383,29 @@ def test_site_kernel_i8(device, use_combine, monkeypatch):
     if use_combine:
         assert rel(outs[0][2], ref_post) < 1e-4
     assert torch.equal(outs[0][1], outs[1][1]) and torch.equal(outs[0][0], outs[1][0])
+
+
+@pytest.mark.parametrize("R", [1])
+def test_site_kernel_repeated_launch_determinism(device, R):
+    # The site kernel's grid barrier once released early about once per 250 launches (a stale generation read):
+    # 64000 launches on fixed inputs must all produce the same bits. Batches of 64 output slots, compared per batch.
+    D, LR, H, B, N = 2560, 320, 4, 64, 64000
+    m = make_site(device, D, LR, True)
+    torch.manual_seed(R)
+    x = torch.randn(R, H, D, device = device) * 3.0
+    y = torch.randn(R, D, device = device)
+    pp = torch.rand(R, H, device = device)
+    bar = torch.zeros(2, dtype = torch.int32, device = device)
+    dots = torch.empty((B, R, LR + H + 1, H), device = device)
+    posts = torch.empty((B, R, H), device = device)
+    mixeds = torch.empty((B, R, D), dtype = torch.half, device = device)
+    xs = torch.empty((B, R, H, D), device = device)
+    ref = None
+    for _ in range(N // B):
+        xs.copy_(x.unsqueeze(0).expand_as(xs))
+        for i in range(B):
+            ext.gr_mix(xs[i], None, m.proj_h[: m.proj_m], m.upx_h, m.w_h, m.rms_eps, dots[i], posts[i], mixeds[i],
+                       y, pp, bar)
+        if ref is None:
+            ref = (xs[0].clone(), posts[0].clone(), mixeds[0].clone())
+        assert (xs == ref[0]).all() and (posts == ref[1]).all() and (mixeds == ref[2]).all()
