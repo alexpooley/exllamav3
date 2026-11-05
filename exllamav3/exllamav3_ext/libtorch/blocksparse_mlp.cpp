@@ -67,7 +67,7 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     }
 }
 
-void BC_BlockSparseMLP::run_bszN
+at::Tensor BC_BlockSparseMLP::run_bszN
 (
     const at::Tensor& y,
     at::Tensor& selected_experts,
@@ -86,7 +86,8 @@ void BC_BlockSparseMLP::run_bszN
     c10::cuda::CUDAGuard device_guard(y.device());
 
 #if defined(USE_ROCM)
-    if (rdna_moe && run_bszN_rdna(y, selected_experts, routing_weights)) return;
+    at::Tensor rdna_result;
+    if (rdna_moe && run_bszN_rdna(y, selected_experts, routing_weights, rdna_result)) return rdna_result;
 #endif
 
     // Shared experts run through their own multi-row graph first (same stream); the kernel adds
@@ -108,6 +109,7 @@ void BC_BlockSparseMLP::run_bszN
         sh_o = out_d_sh_n;
     }
     exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
+    return out_bszn.slice(0, 0, num_tokens);
 }
 
 #if defined(USE_ROCM)
@@ -118,7 +120,8 @@ bool BC_BlockSparseMLP::run_bszN_rdna
 (
     const at::Tensor& y,
     const at::Tensor& selected_experts,
-    const at::Tensor& routing_weights
+    const at::Tensor& routing_weights,
+    at::Tensor& result
 )
 {
     const int bsz = (int) y.size(0);
@@ -144,14 +147,18 @@ bool BC_BlockSparseMLP::run_bszN_rdna
 
     const int H = (int) out_bszn.size(-1);
     at::Tensor routed = out_d2.view({-1, Ho}).slice(0, 0, bsz).slice(1, 0, H);
-    at::Tensor dst = out_bszn.slice(0, 0, bsz);
+    // Unpadded down width: the routed rows are contiguous (bsz, H) rows, so the shared expert merges into them in
+    // place and they are the result, without a copy into out_bszn
+    const bool in_place = Ho == H;
+    at::Tensor dst = in_place ? routed : out_bszn.slice(0, 0, bsz);
+    result = dst;
     if (shared_experts && out_d_sh)
     {
         at::Tensor x_dense = y.unsqueeze(0);
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, bsz);
         shared_experts->run_bszN(x_dense, out_d_sh_n);
         at::Tensor sh = out_d_sh_n.view({bsz, -1}).slice(1, 0, H);
-        dst.copy_(routed);
+        if (!in_place) dst.copy_(routed);
         if (shared_gate)
         {
             // One fused launch (as the CUDA path): dst += sh * sigmoid(y @ w). The ATen form below costs a
@@ -173,7 +180,7 @@ bool BC_BlockSparseMLP::run_bszN_rdna
         else
             dst.add_(sh);
     }
-    else
+    else if (!in_place)
         dst.copy_(routed);
     return true;
 }
