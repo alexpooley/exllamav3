@@ -259,6 +259,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
             add_gr(s.qkv, qkv_proj->bias.value(), s.qkv, graph);
     }
 
+    bool conv_fused = false;
     if (kda)
     {
         // KDA: three fp16 GEMVs off x (patched inputs), low-rank second stages and the gate op
@@ -286,30 +287,41 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
                 add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
         }
 
-        gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
-
-        gated_delta_net_fused_op_3_gr
+        // ba GEMV, beta/g, the qkv cast and the conv update as one launch where it takes the shape
+        conv_fused = gdn_conv_ba_update_gr
         (
-            s.qkv, s.ba,
-            dt_bias, a_log,
-            s.mixed_qkv, s.beta, s.g,
-            beta_scale,
-            graph
+            x, ba_weight_t, ba_bias, s.qkv, dt_bias, a_log,
+            conv_state, slots, conv1d_weight, conv1d_bias, s.conv_out,
+            s.beta, s.g, beta_scale, history, graph
         );
+        if (!conv_fused)
+        {
+            gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+
+            gated_delta_net_fused_op_3_gr
+            (
+                s.qkv, s.ba,
+                dt_bias, a_log,
+                s.mixed_qkv, s.beta, s.g,
+                beta_scale,
+                graph
+            );
+        }
     }
 
-    cuda_causal_conv1d_update_gr
-    (
-        s.mixed_qkv,
-        conv_state,
-        slots,
-        conv1d_weight,
-        conv1d_bias,
-        s.conv_out,
-        true,
-        history,
-        graph
-    );
+    if (!conv_fused)
+        cuda_causal_conv1d_update_gr
+        (
+            s.mixed_qkv,
+            conv_state,
+            slots,
+            conv1d_weight,
+            conv1d_bias,
+            s.conv_out,
+            true,
+            history,
+            graph
+        );
 
     cuda_recurrent_gated_delta_rule_gr
     (
