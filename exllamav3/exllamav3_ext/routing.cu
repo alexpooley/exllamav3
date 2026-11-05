@@ -269,12 +269,12 @@ void routing_gemv
     bool bsz1 = hidden.numel() == k;
 
 #if defined(USE_ROCM)
-    // RDNA: the m = 1..8 router GEMV (rocm/routing_gemv_rdna.cuh). It reads the weights once per row block, so
+    // RDNA: the m = 1..16 router GEMV (rocm/routing_gemv_rdna.cuh). It reads the weights once per row block, so
     // with the deterministic projection available it only takes the smallest row counts, where it is faster;
     // both are fixed-order and agree across devices
-    // EXL3_ROUTING_RDNA_MAX_M: the largest row count that takes the GEMV while the int8 gate exists. Default 8 (the
-    // GEMV covers m = 1..8): at the 4-row MTP verify the int8 projection (quant + GEMM + reduce, three launches)
-    // cost ~0.9 ms more per forward on TP-ts. Both forms are fixed-order and every TP rank runs the same one
+    // EXL3_ROUTING_RDNA_MAX_M: the largest row count that takes the GEMV while the int8 gate exists. Default 8: at the 4-row MTP
+    // verify the int8 projection (quant + GEMM + reduce, three launches) cost ~0.9 ms more per forward on TP-ts;
+    // at 9..16 rows the GEMV (which covers m = 1..16) measured no gain, so the int8 projection keeps them. Both forms are fixed-order and every TP rank runs the same one
     static const int rdna_max_m = [] { const char* e = std::getenv("EXL3_ROUTING_RDNA_MAX_M"); return e ? atoi(e) : 8; }();
     if (gate_t.has_value() && (!gate_i8.has_value() || hidden.numel() / k <= rdna_max_m) &&
         routing_gemv_rdna_try(hidden, gate_t.value(), scores, stream)) return;
