@@ -218,8 +218,8 @@ def test_weighted_copy_handoff(device, D, rank, monkeypatch):
         assert rel(mixed_h, mixed_k) < 1e-3, R
         assert rel(post_h, post_k) < 1e-4, R
         # and the kernel really reads the copy: a poisoned one changes the gates (except the one-launch ROCm
-        # site kernel at R <= 4, which weighs the raw streams itself and ignores the copy)
-        if R <= 4 and torch.version.hip and (D, rank) == (2560, 320):
+        # site kernels at R <= 16, which weigh the raw streams themselves and ignore the copy)
+        if R <= 16 and torch.version.hip and (D, rank) == (2560, 320):
             continue
         a.apply_(x, torch.zeros_like(y), post, None, params)
         params["gr_weighted"][2].mul_(0.0)
@@ -334,7 +334,7 @@ def test_folded_apply_flush(device, monkeypatch):
 
 
 @pytest.mark.parametrize("use_combine", [True, False])
-@pytest.mark.parametrize("R", [1, 2, 3, 4])
+@pytest.mark.parametrize("R", [1, 2, 3, 4, 5, 8, 12, 16])
 def test_site_kernel_r1(device, use_combine, R):
     # R <= 4 on the Qwen3.8 shape takes the one-launch site kernel on ROCm: reference agreement, bits run to run
     m = make_site(device, 2560, 320, use_combine)
@@ -386,7 +386,7 @@ def test_site_kernel_i8(device, use_combine, monkeypatch):
     assert torch.equal(outs[0][1], outs[1][1]) and torch.equal(outs[0][0], outs[1][0])
 
 
-@pytest.mark.parametrize("R", [1, 2, 3, 4])
+@pytest.mark.parametrize("R", [1, 2, 3, 4, 5, 8, 12, 16])
 def test_site_kernel_repeated_launch_determinism(device, R):
     # The site kernel's grid barrier once released early about once per 250 launches (a stale generation read):
     # 64000 launches on fixed inputs must all produce the same bits. Batches of 64 output slots, compared per batch.

@@ -609,6 +609,9 @@ void gr_site_kernel
     const float rms_eps
 )
 {
+    // Drop this CU's L0 / GL1 lines before the first read: the streams are rewritten in place by every site (and the
+    // pending y by the sublayer), and a line another kernel left in the non-coherent caches would be stale
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     constexpr int M = LR + (POST ? H : 0);
     constexpr int D4 = D / 4;
     constexpr int KC = D / 8 / 32;       // fp16: 8 columns per int4
@@ -934,20 +937,279 @@ void gr_site_kernel
 }
 
 
+// Site kernel for 5..16 rows (batched / longer verify forwards; fp16 tables), the row count at run time. The stack of stream hb is built and
+// consumed in groups of up to 4 rows (40 KB of LDS); t for all rows stays in LDS (20 KB). Phase 2 reads each lane's
+// own stream / y values from global (only this warp writes them back).
+template <int H, int D, int LR, bool POST, bool APPLY, typename Y_T>
+__global__ __launch_bounds__(GRS_NT) __attribute__((amdgpu_waves_per_eu(8, 8)))
+void gr_site16_kernel
+(
+    float* __restrict__ x, const Y_T* __restrict__ y, const float* __restrict__ pp, const half* __restrict__ fn,
+    const half* __restrict__ upt, const half* __restrict__ w, float* __restrict__ dots, float* __restrict__ post,
+    half* __restrict__ mixed, unsigned* __restrict__ bar, const float rms_eps, const int R
+)
+{
+    // Drop this CU's L0 / GL1 lines before the first read: the streams are rewritten in place by every site (and the
+    // pending y by the sublayer), and a line another kernel left in the non-coherent caches would be stale
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    constexpr int RMAX = 16, G = 4;
+    constexpr int M = LR + (POST ? H : 0);
+    constexpr int D4 = D / 4;
+    constexpr int KC = D / 8 / 32;
+    constexpr int NIT = LR / 64;
+    constexpr int NBH = GRS_NB / H;
+    constexpr int MQ = 8;
+    constexpr int K0 = (G * D4 + GRS_NT - 1) / GRS_NT;
+    constexpr int KT = (RMAX * LR + GRS_NT - 1) / GRS_NT;
+
+    const int nb = gridDim.x;
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int hb = b % H, bi = b / H;
+
+    __shared__ float4 sw4[G][D4];
+    __shared__ float t_s[RMAX][LR];
+    __shared__ float red[RMAX][GRS_NW];
+    __shared__ float rmr_s[RMAX][H];
+
+    const int j0 = bi * M / NBH, j1 = (bi + 1) * M / NBH;
+    const int ja = j0 + warp;
+    const bool has_j = ja < j1;
+    const int jc = min(ja, M - 1);
+    const int q0 = b * D4 / nb, q1 = (b + 1) * D4 / nb;
+    const int qc = q0 + warp;
+    const bool has_q = warp < MQ && qc < q1;
+    const int qcl = min(qc, D4 - 1);
+
+    // Phase 0a: weights first
+    int4 fa[KC];
+    {
+        const int4* ra = (const int4*) (fn + ((size_t) jc * H + hb) * D);
+        #pragma unroll
+        for (int k = 0; k < KC; ++k) fa[k] = ra[lane + 32 * k];
+    }
+    int4 u[NIT][H];
+    if (warp < MQ)
+    {
+        #pragma unroll
+        for (int it = 0; it < NIT; ++it)
+            #pragma unroll
+            for (int h = 0; h < H; ++h)
+                u[it][h] = *(const int4*) (upt + (((size_t) h * D4 + qcl) * LR + 2 * lane + 64 * it) * 4);
+    }
+
+    // Phases 0c + 1 per group of up to G rows: stack (all loads first), sums of squares, dots
+    #pragma unroll 1
+    for (int g0 = 0; g0 < R; g0 += G)
+    {
+        const int gn = min(G, R - g0);
+        float4 xv[K0], yv[K0];
+        #pragma unroll
+        for (int k = 0; k < K0; ++k)
+        {
+            const int i = min(tid + GRS_NT * k, gn * D4 - 1), r = g0 + i / D4, c = i % D4;
+            xv[k] = ((const float4*) (x + ((size_t) r * H + hb) * D))[c];
+            if constexpr (APPLY) yv[k] = grs_load_y4<Y_T>(y + (size_t) r * D, c);
+        }
+        float ss[G];
+        #pragma unroll
+        for (int r = 0; r < G; ++r) ss[r] = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < K0; ++k)
+        {
+            const int i = tid + GRS_NT * k;
+            if (i >= gn * D4) break;
+            const int rl = i / D4, c = i % D4;
+            float4 v = xv[k];
+            if constexpr (APPLY) v = grs_fma4(pp[(g0 + rl) * H + hb], yv[k], v);
+            const float sq = fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, v.w * v.w)));
+            #pragma unroll
+            for (int rr = 0; rr < G; ++rr) if (rr == rl) ss[rr] += sq;
+            const half2* w2 = (const half2*) (w + (size_t) hb * D + 4 * c);
+            float2 w01 = __half22float2(w2[0]), w23 = __half22float2(w2[1]);
+            sw4[rl][c] = make_float4(__fmul_rn(v.x, w01.x), __fmul_rn(v.y, w01.y),
+                                     __fmul_rn(v.z, w23.x), __fmul_rn(v.w, w23.y));
+        }
+        #pragma unroll
+        for (int rl = 0; rl < G; ++rl)
+        {
+            const float v = hc_warp_sum_lane0(ss[rl]);
+            if (lane == 0 && rl < gn) red[g0 + rl][warp] = v;
+        }
+        __syncthreads();
+        #pragma unroll 1
+        for (int rl = 0; rl < gn; ++rl)
+        {
+            #pragma unroll
+            for (int k = 0; k < KC; ++k) grs_opaque(fa[k]);
+            const float4* s = sw4[rl];
+            float a = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < KC; ++k)
+            {
+                const int c8 = lane + 32 * k;
+                const float4 s0 = s[2 * c8], s1 = s[2 * c8 + 1];
+                const half2* f2 = (const half2*) &fa[k];
+                float2 a01 = __half22float2(f2[0]), a23 = __half22float2(f2[1]);
+                float2 b01 = __half22float2(f2[2]), b23 = __half22float2(f2[3]);
+                a = fmaf(s0.x, a01.x, a); a = fmaf(s0.y, a01.y, a);
+                a = fmaf(s0.z, a23.x, a); a = fmaf(s0.w, a23.y, a);
+                a = fmaf(s1.x, b01.x, a); a = fmaf(s1.y, b01.y, a);
+                a = fmaf(s1.z, b23.x, a); a = fmaf(s1.w, b23.y, a);
+            }
+            a = hc_warp_sum_lane0(a);
+            if (has_j && lane == 0)
+                __hip_atomic_store(dots + ((size_t) (g0 + rl) * (M + 1) + ja) * H + hb, a, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        __syncthreads();                                   // the next group overwrites the stack
+    }
+    if (bi == 0 && tid < R)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < GRS_NW; ++i) v += red[tid][i];
+        __hip_atomic_store(dots + ((size_t) tid * (M + 1) + M) * H + hb, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+
+    grs_grid_barrier(bar, nb);
+
+    // Phase 2: rmr and t for every row
+    float4 dv[KT];
+    #pragma unroll
+    for (int k = 0; k < KT; ++k)
+    {
+        const int i = tid + GRS_NT * k, r = i / LR, l = i % LR;
+        if (i >= R * LR) break;
+        const float* dp = dots + ((size_t) r * (M + 1) + l) * H;
+        dv[k] = *(const float4*) dp;     // after the barrier's acquire fence (L0 / GL1 invalidated); the stores
+                                         // are agent-scope atomics. 16-byte loads: R x 320 x 4 floats per block
+    }
+    if (tid < R * H)
+    {
+        const int r = tid / H, h = tid % H;
+        rmr_s[r][h] = rsqrtf(__hip_atomic_load(dots + ((size_t) r * (M + 1) + M) * H + h, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) / (float) D + rms_eps);
+    }
+    __syncthreads();
+    const float inv_h = 1.0f / (float) H;
+    #pragma unroll
+    for (int k = 0; k < KT; ++k)
+    {
+        const int i = tid + GRS_NT * k;
+        if (i >= R * LR) break;
+        const int r = i / LR, l = i % LR;
+        float v = fmaf(rmr_s[r][3], dv[k].w, fmaf(rmr_s[r][2], dv[k].z, fmaf(rmr_s[r][1], dv[k].y, rmr_s[r][0] * dv[k].x)));
+        v *= inv_h;
+        t_s[r][l] = v * sigmoidf_(v);
+    }
+    if (POST && b == 0 && tid < R * H)
+    {
+        const int r = tid / H, hh = tid % H;
+        const float* dr = dots + (size_t) r * (M + 1) * H;
+        float v = 0.0f;
+        #pragma unroll
+        for (int h = 0; h < H; ++h) v = fmaf(rmr_s[r][h], __hip_atomic_load(dr + (LR + hh) * H + h, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), v);
+        post[r * H + hh] = 2.0f * sigmoidf_(v * inv_h);
+    }
+    __syncthreads();
+    if (!has_q) return;
+
+    const int le = lane & 3, lh = (lane >> 2) & 3, lrl = lane >> 4;
+    const float wl = __half2float(w[(size_t) lh * D + 4 * qc + le]);
+    auto lane_vals = [&](int rr, float& xs_, float& ys_)
+    {
+        xs_ = x[((size_t) rr * H + lh) * D + 4 * qc + le];
+        ys_ = 0.0f;
+        if constexpr (APPLY)
+        {
+            if constexpr (std::is_same_v<Y_T, half>) ys_ = __half2float(y[(size_t) rr * D + 4 * qc + le]);
+            else ys_ = y[(size_t) rr * D + 4 * qc + le];
+        }
+    };
+    float nx, ny;
+    lane_vals(min(lrl, R - 1), nx, ny);
+    #pragma unroll 1
+    for (int r0 = 0; r0 < R; r0 += 2)
+    {
+        const int nr = min(2, R - r0);
+        const int r = r0 + lrl;
+        const bool live = lrl < nr;
+        const int rc = min(r, R - 1);
+        float sv = nx, yl = ny;
+        lane_vals(min(r0 + 2 + lrl, R - 1), nx, ny);      // next pair's, in flight during this pair's math
+        float g[32];
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) g[i] = 0.0f;
+        #pragma unroll
+        for (int it = 0; it < NIT; ++it)
+            #pragma unroll
+            for (int h = 0; h < H; ++h) grs_opaque(u[it][h]);
+        #pragma unroll
+        for (int it = 0; it < NIT; ++it)
+        {
+            float t0[2], t1[2];
+            #pragma unroll
+            for (int rl = 0; rl < 2; ++rl)
+            {
+                const int rr = min(r0 + rl, R - 1);
+                t0[rl] = t_s[rr][2 * lane + 64 * it];
+                t1[rl] = t_s[rr][2 * lane + 64 * it + 1];
+            }
+            #pragma unroll
+            for (int h = 0; h < H; ++h)
+            {
+                const half2* u2 = (const half2*) &u[it][h];
+                float2 a01 = __half22float2(u2[0]), a23 = __half22float2(u2[1]);
+                float2 b01 = __half22float2(u2[2]), b23 = __half22float2(u2[3]);
+                const float ua[4] = { a01.x, a01.y, a23.x, a23.y };
+                const float ub[4] = { b01.x, b01.y, b23.x, b23.y };
+                #pragma unroll
+                for (int rl = 0; rl < 2; ++rl)
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        float& gg = g[(rl * H + h) * 4 + e];
+                        gg = fmaf(t1[rl], ub[e], fmaf(t0[rl], ua[e], gg));
+                    }
+            }
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        #define RS_STEP(O, N) \
+            { const bool up = (lane & O) != 0; \
+              _Pragma("unroll") for (int i = 0; i < N / 2; ++i) { \
+                const float keep = up ? g[i + N / 2] : g[i]; const float send = up ? g[i] : g[i + N / 2]; \
+                g[i] = keep + ((O) == 16 ? hc_permlanex16(send) : hc_xor16<(O) == 16 ? 1 : (O)>(send)); } }
+        RS_STEP(16, 32)
+        RS_STEP(8, 16)
+        RS_STEP(4, 8)
+        RS_STEP(2, 4)
+        RS_STEP(1, 2)
+        #undef RS_STEP
+        if constexpr (APPLY) sv = fmaf(pp[rc * H + lh], yl, sv);
+        float term = sigmoidf_(g[0]) * (rmr_s[rc][lh] * inv_h) * wl * sv;
+        term += hc_xor16<4>(term);
+        term += hc_xor16<8>(term);
+        if (live)
+        {
+            if constexpr (APPLY) x[((size_t) r * H + lh) * D + 4 * qc + le] = sv;
+            if (lh == 0) mixed[(size_t) r * D + 4 * qc + le] = __float2half_rn(term);
+        }
+    }
+}
+
 // Launch a site kernel on its fixed grid of GRS_NB blocks, which must all be co-resident (the grid barrier):
 // false (nothing launched) when the device holds fewer
-template <typename K, typename Y_T>
-static bool gr_site_launch(K kernel, float* x, const Y_T* y, const float* pp, const void* fn, const half* fn_s,
-                           const void* upt, const half* upt_s, const half* w, float* dots, float* post, half* mixed,
-                           unsigned* bar, float eps, cudaStream_t stream)
+// Whether GRS_NB blocks of a site kernel are co-resident on this device (the grid barrier needs all of them)
+static bool gr_site_coresident(const void* kernel)
 {
     int dev; cudaGetDevice(&dev);
-    static int caps[16][32] = { { 0 } };
+    static int caps[16][64] = { { 0 } };
     static int slot_next = 0;
-    static const void* slots[32] = { nullptr };
+    static const void* slots[64] = { nullptr };
     int slot = -1;
-    for (int i = 0; i < slot_next; ++i) if (slots[i] == (const void*) kernel) slot = i;
-    if (slot < 0) { if (slot_next == 32) return false; slot = slot_next++; slots[slot] = (const void*) kernel; }
+    for (int i = 0; i < slot_next; ++i) if (slots[i] == kernel) slot = i;
+    if (slot < 0) { if (slot_next == 64) return false; slot = slot_next++; slots[slot] = kernel; }
     if (!caps[dev][slot])
     {
         cudaDeviceProp p; cudaGetDeviceProperties(&p, dev);
@@ -955,16 +1217,47 @@ static bool gr_site_launch(K kernel, float* x, const Y_T* y, const float* pp, co
         // LDS and VGPRs against one CU). A WGP holds two of these blocks when each fits one CU: 16 wave32 waves
         // over 2 SIMDs at <= 192 VGPRs (1536 per SIMD lane on gfx1100) and <= 64 KB of LDS. Measured: 96 blocks
         // run co-resident on gfx1100's 48 WGPs (the barrier completes)
-        cudaFuncAttributes fa; cudaFuncGetAttributes(&fa, (const void*) kernel);
+        cudaFuncAttributes fa; cudaFuncGetAttributes(&fa, kernel);
         int per = 0;
         if (strncmp(p.gcnArchName, "gfx11", 5) == 0 && fa.numRegs <= 192 && fa.sharedSizeBytes <= 65536) per = 2;
         else cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kernel, GRS_NT, 0);
         caps[dev][slot] = per * p.multiProcessorCount >= GRS_NB ? 1 : -1;
     }
-    if (caps[dev][slot] < 0) return false;
+    return caps[dev][slot] > 0;
+}
+
+// Launch a 1..4-row site kernel on its fixed grid of GRS_NB blocks; false (nothing launched) when the device
+// cannot hold them all at once
+template <typename K, typename Y_T>
+static bool gr_site_launch(K kernel, float* x, const Y_T* y, const float* pp, const void* fn, const half* fn_s,
+                           const void* upt, const half* upt_s, const half* w, float* dots, float* post, half* mixed,
+                           unsigned* bar, float eps, cudaStream_t stream)
+{
+    if (!gr_site_coresident((const void*) kernel)) return false;
     kernel<<<GRS_NB, GRS_NT, 0, stream>>>(x, y, pp, fn, fn_s, upt, upt_s, w, dots, post, mixed, bar, eps);
     cuda_check(cudaPeekAtLastError());
     return true;
+}
+
+// The 5..16-row site kernel (fp16 tables)
+static bool gr_site16_dispatch
+(
+    int R, float* s_p, const void* py, bool y_half, const float* ppost, const half* fn, const half* upt,
+    const half* w_p, float* dots_p, float* post_p, half* mixed_p, unsigned* bar, float eps, cudaStream_t stream
+)
+{
+    const bool apply = py != nullptr;
+    bool done = false;
+    #define SITE16(POST_, AP, Y_T) \
+        { auto kk = gr_site16_kernel<4, 2560, 320, POST_, AP, Y_T>; \
+          if (gr_site_coresident((const void*) kk)) { \
+              kk<<<GRS_NB, GRS_NT, 0, stream>>>(s_p, (const Y_T*) py, ppost, fn, upt, w_p, dots_p, post_p, mixed_p, bar, eps, R); \
+              cuda_check(cudaPeekAtLastError()); done = true; } }
+    #define SITE16_P(POST_) if (!apply) SITE16(POST_, false, float) else if (y_half) SITE16(POST_, true, half) else SITE16(POST_, true, float)
+    if (post_p) { SITE16_P(true) } else { SITE16_P(false) }
+    #undef SITE16_P
+    #undef SITE16
+    return done;
 }
 
 // Site kernel dispatch over rows (1..4), form, apply and y dtype
@@ -1016,6 +1309,12 @@ static bool gr_mix_rdna_try
     if (!site_off && bar && R >= 1 && R <= 4 && half_out && D == 2560 && LR == 320 &&
         gr_site_dispatch<false>(R, s_p, py, y_half, ppost, fn_p, nullptr, upt_p, nullptr, w_p, dots_p, post_p,
                                 (half*) mixed_p, bar, rms_eps, stream))
+        return true;
+    // 5..16 rows: off unless EXL3_GR_SITE16=1 (TP-ts run-to-run determinism still open, see hyperconnections.py)
+    static const bool site16_on = [] { const char* e = getenv("EXL3_GR_SITE16"); return e && e[0] == '1'; }();
+    if (!site_off && site16_on && bar && R >= 5 && R <= 16 && half_out && D == 2560 && LR == 320 &&
+        gr_site16_dispatch(R, s_p, py, y_half, ppost, fn_p, upt_p, w_p, dots_p, post_p, (half*) mixed_p, bar,
+                           rms_eps, stream))
         return true;
     const int D8 = D / 8;
     if (D % 16 || (LR != 320 && LR != 512)) return false;
